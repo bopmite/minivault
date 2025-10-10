@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  vault1:
+    build: .
+    ports:
+      - "3001:3000"
+    command: ["-port", "3000", "-data", "/app/data", "-volumes", "http://vault2:3000,http://vault3:3000"]
+    volumes:
+      - vault1_data:/app/data
+    networks:
+      - vaultnet
+
+  vault2:
+    build: .
+    ports:
+      - "3002:3000"
+    command: ["-port", "3000", "-data", "/app/data", "-volumes", "http://vault1:3000,http://vault3:3000"]
+    volumes:
+      - vault2_data:/app/data
+    networks:
+      - vaultnet
+
+  vault3:
+    build: .
+    ports:
+      - "3003:3000"
+    command: ["-port", "3000", "-data", "/app/data", "-volumes", "http://vault1:3000,http://vault2:3000"]
+    volumes:
+      - vault3_data:/app/data
+    networks:
+      - vaultnet
+
+volumes:
+  vault1_data:
+  vault2_data:
+  vault3_data:
+
+networks:
+  vaultnet:
+    driver: bridge
