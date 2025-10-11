@@ -1,9 +1,19 @@
 #!/bin/bash
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -n "$1" ] && [[ "$1" != -* ]]; then
-    DATA_DIR="$1"
-    shift
-    exec "$DIR/minivault" -mode worker -data "$DATA_DIR" "$@"
+set -e
+
+DATA_DIR="${1:-./data}"
+PORT="${PORT:-3000}"
+MASTER="${MASTER:-}"
+
+if [ ! -f "./minivault" ]; then
+    echo "Building minivault..."
+    go build -o minivault src/*.go
+fi
+
+mkdir -p "$DATA_DIR"
+
+if [ -n "$MASTER" ]; then
+    exec ./minivault -port "$PORT" -data "$DATA_DIR" -master "$MASTER"
 else
-    exec "$DIR/minivault" -mode worker "$@"
+    exec ./minivault -port "$PORT" -data "$DATA_DIR"
 fi
