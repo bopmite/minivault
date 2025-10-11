@@ -35,7 +35,7 @@ func main() {
 	port := flag.Int("port", 3000, "Port to listen on")
 	publicURL := flag.String("public-url", "", "Public URL for this worker")
 	masterURL := flag.String("master", "", "Master server URL")
-	dataDir := flag.String("data", "./data", "Data directory")
+	dataDir := flag.String("data", "/data", "Data directory")
 	volumes := flag.String("volumes", "", "Comma-separated volume URLs (master mode)")
 	authKey := flag.String("auth", "", "Shared secret for cluster auth")
 	flag.Parse()

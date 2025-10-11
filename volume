@@ -1,1 +1,9 @@
-minivault
+#!/bin/bash
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "$1" ] && [[ "$1" != -* ]]; then
+    DATA_DIR="$1"
+    shift
+    exec "$DIR/minivault" -mode worker -data "$DATA_DIR" "$@"
+else
+    exec "$DIR/minivault" -mode worker "$@"
+fi
