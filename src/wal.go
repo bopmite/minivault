@@ -62,29 +62,32 @@ func (w *wal) flusher() {
 	for {
 		select {
 		case e := <-w.ch:
+			w.mu.Lock()
 			w.batch = append(w.batch, e)
 			if len(w.batch) >= walMaxBatch {
-				w.flush()
+				w.flushLocked()
 			}
+			w.mu.Unlock()
 		case <-ticker.C:
+			w.mu.Lock()
 			if len(w.batch) > 0 {
-				w.flush()
+				w.flushLocked()
 			}
+			w.mu.Unlock()
 		case <-w.done:
-			w.flush()
+			w.mu.Lock()
+			w.flushLocked()
+			w.mu.Unlock()
 			w.file.Close()
 			return
 		}
 	}
 }
 
-func (w *wal) flush() {
+func (w *wal) flushLocked() {
 	if len(w.batch) == 0 {
 		return
 	}
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	var buf [16]byte
 	for _, e := range w.batch {
@@ -99,6 +102,12 @@ func (w *wal) flush() {
 
 	w.file.Sync()
 	w.batch = w.batch[:0]
+}
+
+func (w *wal) flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.flushLocked()
 }
 
 func (w *wal) close() {
