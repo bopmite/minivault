@@ -22,30 +22,15 @@ type Cluster struct {
 	master  string
 	nodes   sync.Map
 	client  *http.Client
-	workers chan struct{} // Goroutine pool
+	workers chan struct{}
 	authKey string
 	storage *Storage
 }
 
-type NodeInfo struct {
-	URL      string
-	LastSeen time.Time
-	Load     float64
-}
-
-type SyncMessage struct {
-	Key   string `json:"key"`
-	Value []byte `json:"value"`
-	Hash  string `json:"hash"`
-}
-
-type RegisterRequest struct {
-	URL  string  `json:"url"`
-	Load float64 `json:"load"`
-}
-
-type NodesResponse struct {
-	Nodes []string `json:"nodes"`
+type node struct {
+	url  string
+	seen time.Time
+	load float64
 }
 
 func NewCluster(self, master, authKey string, storage *Storage) *Cluster {
@@ -54,120 +39,146 @@ func NewCluster(self, master, authKey string, storage *Storage) *Cluster {
 		master:  master,
 		authKey: authKey,
 		storage: storage,
-		workers: make(chan struct{}, WorkerPoolSize),
+		workers: make(chan struct{}, WorkerPool),
 		client: &http.Client{
 			Timeout: WriteTimeout,
 			Transport: &http.Transport{
 				MaxIdleConns:        200,
 				MaxIdleConnsPerHost: 50,
 				IdleConnTimeout:     90 * time.Second,
-				DisableCompression:  false,
 			},
 		},
 	}
 
-	for i := 0; i < WorkerPoolSize; i++ {
+	for i := 0; i < WorkerPool; i++ {
 		c.workers <- struct{}{}
 	}
 
-	c.nodes.Store(self, &NodeInfo{URL: self, LastSeen: time.Now()})
+	c.nodes.Store(self, &node{url: self, seen: time.Now()})
 	return c
 }
 
-func (c *Cluster) registerWithMaster() {
+func (c *Cluster) start() {
+	c.register()
+
+	go func() {
+		ticker := time.NewTicker(Heartbeat)
+		defer ticker.Stop()
+		for range ticker.C {
+			c.heartbeat()
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(Heartbeat)
+		defer ticker.Stop()
+		for range ticker.C {
+			c.syncNodes()
+		}
+	}()
+}
+
+type regReq struct {
+	URL  string  `json:"url"`
+	Load float64 `json:"load"`
+}
+
+func (c *Cluster) register() {
 	if c.master == "" {
 		return
 	}
 
 	load := float64(runtime.NumGoroutine())
-	data, _ := json.Marshal(RegisterRequest{URL: c.self, Load: load})
+	data, _ := json.Marshal(regReq{URL: c.self, Load: load})
 
 	req, _ := http.NewRequest(http.MethodPost, c.master+"/register", bytes.NewReader(data))
 	req.Header.Set("Content-Type", "application/json")
-	c.signRequest(req)
+	c.sign(req)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		log.Printf("Failed to register: %v", err)
+		log.Printf("register failed: %v", err)
 		return
 	}
 	resp.Body.Close()
 }
 
-func (c *Cluster) heartbeatLoop() {
-	ticker := time.NewTicker(HeartbeatInterval)
-	for range ticker.C {
-		c.sendHeartbeat()
-	}
-}
-
-func (c *Cluster) sendHeartbeat() {
+func (c *Cluster) heartbeat() {
 	if c.master == "" {
 		return
 	}
 
 	load := float64(runtime.NumGoroutine())
-	data, _ := json.Marshal(RegisterRequest{URL: c.self, Load: load})
+	data, _ := json.Marshal(regReq{URL: c.self, Load: load})
 
 	req, _ := http.NewRequest(http.MethodPost, c.master+"/heartbeat", bytes.NewReader(data))
 	req.Header.Set("Content-Type", "application/json")
-	c.signRequest(req)
+	c.sign(req)
+
+	resp, err := c.client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+	}
+}
+
+type nodesResp struct {
+	Nodes []string `json:"nodes"`
+}
+
+func (c *Cluster) syncNodes() {
+	req, _ := http.NewRequest(http.MethodGet, c.master+"/nodes", nil)
+	c.sign(req)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return
 	}
-	resp.Body.Close()
-}
+	defer resp.Body.Close()
 
-func (c *Cluster) syncNodesLoop() {
-	ticker := time.NewTicker(HeartbeatInterval)
-	for range ticker.C {
-		req, _ := http.NewRequest(http.MethodGet, c.master+"/nodes", nil)
-		c.signRequest(req)
+	var nr nodesResp
+	json.NewDecoder(resp.Body).Decode(&nr)
 
-		resp, err := c.client.Do(req)
-		if err != nil {
-			continue
-		}
-
-		var nodesResp NodesResponse
-		json.NewDecoder(resp.Body).Decode(&nodesResp)
-		resp.Body.Close()
-
-		for _, url := range nodesResp.Nodes {
-			if _, exists := c.nodes.Load(url); !exists {
-				c.nodes.Store(url, &NodeInfo{URL: url, LastSeen: time.Now()})
-			}
+	for _, url := range nr.Nodes {
+		if _, ok := c.nodes.Load(url); !ok {
+			c.nodes.Store(url, &node{url: url, seen: time.Now()})
 		}
 	}
 }
 
 func (c *Cluster) getNodes() []string {
 	var nodes []string
-	c.nodes.Range(func(key, _ interface{}) bool {
+	c.nodes.Range(func(key, _ any) bool {
 		nodes = append(nodes, key.(string))
 		return true
 	})
 	return nodes
 }
 
-func (c *Cluster) rendezvousHash(key string, count int) []string {
+func (c *Cluster) count() int {
+	n := 0
+	c.nodes.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+func (c *Cluster) hash(key string, count int) []string {
 	nodes := c.getNodes()
 	if len(nodes) == 0 {
 		return nil
 	}
 
-	type scored struct {
+	type score struct {
 		node string
 		hash uint32
 	}
 
-	scores := make([]scored, len(nodes))
-	for i, node := range nodes {
+	scores := make([]score, len(nodes))
+	for i, n := range nodes {
 		h := crc32.NewIEEE()
-		h.Write([]byte(key + node))
-		scores[i] = scored{node: node, hash: h.Sum32()}
+		h.Write([]byte(key + n))
+		scores[i] = score{node: n, hash: h.Sum32()}
 	}
 
 	sort.Slice(scores, func(i, j int) bool {
@@ -186,89 +197,92 @@ func (c *Cluster) rendezvousHash(key string, count int) []string {
 	return result
 }
 
-func (c *Cluster) QuorumWrite(key string, value []byte) error {
-	nodes := c.rendezvousHash(key, ReplicationFactor)
+func (c *Cluster) write(key string, data []byte) error {
+	nodes := c.hash(key, ReplicaCount)
 	if len(nodes) == 0 {
-		return fmt.Errorf("no nodes available")
+		return fmt.Errorf("no nodes")
 	}
 
 	quorum := (len(nodes) / 2) + 1
 	results := make(chan error, len(nodes))
 	timeout := time.After(WriteTimeout)
 
-	for _, node := range nodes {
+	for _, n := range nodes {
 		<-c.workers
-		go func(n string) {
+		go func(node string) {
 			defer func() { c.workers <- struct{}{} }()
 
 			var err error
-			if n == c.self {
-				err = c.storage.Set(key, value)
+			if node == c.self {
+				err = c.storage.Set(key, data)
 			} else {
-				err = c.syncWrite(n, key, value)
+				err = c.sync(node, key, data)
 			}
 			results <- err
-		}(node)
+		}(n)
 	}
 
-	successes := 0
+	ok := 0
 	for i := 0; i < len(nodes); i++ {
 		select {
 		case err := <-results:
 			if err == nil {
-				successes++
-				if successes >= quorum {
+				ok++
+				if ok >= quorum {
 					return nil
 				}
 			}
 		case <-timeout:
-			return fmt.Errorf("quorum timeout")
+			return fmt.Errorf("timeout")
 		}
 	}
 
-	return fmt.Errorf("quorum not reached: %d/%d", successes, quorum)
+	return fmt.Errorf("quorum failed: %d/%d", ok, quorum)
 }
 
-func (c *Cluster) QuorumRead(key string) ([]byte, error) {
-	nodes := c.rendezvousHash(key, ReplicationFactor)
+func (c *Cluster) read(key string) ([]byte, error) {
+	nodes := c.hash(key, ReplicaCount)
 
-	for _, node := range nodes {
-		var value []byte
+	for _, n := range nodes {
+		var data []byte
 		var err error
 
-		if node == c.self {
-			value, err = c.storage.Get(key)
+		if n == c.self {
+			data, err = c.storage.Get(key)
 		} else {
-			value, err = c.fetchFrom(node, key)
+			data, err = c.fetch(n, key)
 		}
 
 		if err == nil {
-			if node != c.self {
-				_ = c.storage.Set(key, value)
+			if n != c.self {
+				_ = c.storage.Set(key, data)
 			}
-			return value, nil
+			return data, nil
 		}
 	}
 
 	return nil, fmt.Errorf("not found")
 }
 
-func (c *Cluster) syncWrite(node, key string, value []byte) error {
-	hash := computeHash(value)
-	msg := SyncMessage{Key: key, Value: value, Hash: hash}
+func (c *Cluster) sync(node, key string, data []byte) error {
+	msg := syncMsg{
+		Key:  key,
+		Data: data,
+		Hash: hash64(data),
+	}
 
-	data, err := json.Marshal(msg)
+	body, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequest(http.MethodPut, node+"/_sync", bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPut, node+"/_sync", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	c.signRequest(req)
+	c.sign(req)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -283,13 +297,13 @@ func (c *Cluster) syncWrite(node, key string, value []byte) error {
 	return nil
 }
 
-func (c *Cluster) fetchFrom(node, key string) ([]byte, error) {
+func (c *Cluster) fetch(node, key string) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodGet, node+"/"+key, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	c.signRequest(req)
+	c.sign(req)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -304,41 +318,36 @@ func (c *Cluster) fetchFrom(node, key string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-func (c *Cluster) signRequest(req *http.Request) {
+func (c *Cluster) sign(req *http.Request) {
 	if c.authKey == "" {
 		return
 	}
 
-	timestamp := fmt.Sprintf("%d", time.Now().Unix())
-	req.Header.Set("X-Timestamp", timestamp)
+	ts := fmt.Sprintf("%d", time.Now().Unix())
+	req.Header.Set("X-Timestamp", ts)
 
 	h := hmac.New(sha256.New, []byte(c.authKey))
-	h.Write([]byte(req.Method + req.URL.Path + timestamp))
+	h.Write([]byte(req.Method + req.URL.Path + ts))
 	sig := hex.EncodeToString(h.Sum(nil))
 
 	req.Header.Set("X-Signature", sig)
 }
 
-func (c *Cluster) verifyRequest(req *http.Request) bool {
+func (c *Cluster) verify(req *http.Request) bool {
 	if c.authKey == "" {
 		return true
 	}
 
-	timestamp := req.Header.Get("X-Timestamp")
-	signature := req.Header.Get("X-Signature")
+	ts := req.Header.Get("X-Timestamp")
+	sig := req.Header.Get("X-Signature")
 
-	if timestamp == "" || signature == "" {
+	if ts == "" || sig == "" {
 		return false
 	}
 
 	h := hmac.New(sha256.New, []byte(c.authKey))
-	h.Write([]byte(req.Method + req.URL.Path + timestamp))
+	h.Write([]byte(req.Method + req.URL.Path + ts))
 	expected := hex.EncodeToString(h.Sum(nil))
 
-	return hmac.Equal([]byte(signature), []byte(expected))
-}
-
-func computeHash(data []byte) string {
-	h := sha256.Sum256(data)
-	return hex.EncodeToString(h[:])
+	return hmac.Equal([]byte(sig), []byte(expected))
 }

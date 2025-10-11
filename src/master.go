@@ -10,13 +10,13 @@ import (
 	"time"
 )
 
-type MasterService struct {
+type Master struct {
 	mu    sync.RWMutex
-	nodes map[string]*NodeInfo
+	nodes map[string]*node
 }
 
 func runMaster(port int, volumes string) {
-	master := &MasterService{nodes: make(map[string]*NodeInfo)}
+	m := &Master{nodes: make(map[string]*node)}
 
 	if volumes != "" {
 		for _, v := range strings.Split(volumes, ",") {
@@ -25,112 +25,112 @@ func runMaster(port int, volumes string) {
 				if !strings.HasPrefix(v, "http") {
 					v = "http://" + v
 				}
-				master.nodes[v] = &NodeInfo{URL: v, LastSeen: time.Now()}
-				log.Printf("Static volume: %s", v)
+				m.nodes[v] = &node{url: v, seen: time.Now()}
+				log.Printf("volume: %s", v)
 			}
 		}
 	}
 
-	http.HandleFunc("/register", master.handleRegister)
-	http.HandleFunc("/heartbeat", master.handleHeartbeat)
-	http.HandleFunc("/nodes", master.handleNodes)
-	http.HandleFunc("/health", master.handleHealth)
+	http.HandleFunc("/register", m.handleRegister)
+	http.HandleFunc("/heartbeat", m.handleHeartbeat)
+	http.HandleFunc("/nodes", m.handleNodes)
+	http.HandleFunc("/health", m.handleHealth)
 
-	go master.pruneDeadNodes()
+	go m.pruner()
 
-	log.Printf("Master server starting on :%d", port)
+	log.Printf("master on :%d", port)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
 }
 
-func (m *MasterService) handleRegister(w http.ResponseWriter, r *http.Request) {
+func (m *Master) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	var req RegisterRequest
+	var req regReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
 
 	m.mu.Lock()
-	m.nodes[req.URL] = &NodeInfo{
-		URL:      req.URL,
-		LastSeen: time.Now(),
-		Load:     req.Load,
+	m.nodes[req.URL] = &node{
+		url:  req.URL,
+		seen: time.Now(),
+		load: req.Load,
 	}
 	m.mu.Unlock()
 
-	log.Printf("Worker registered: %s", req.URL)
+	log.Printf("registered: %s", req.URL)
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
-func (m *MasterService) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+func (m *Master) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	var req RegisterRequest
+	var req regReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
 
 	m.mu.Lock()
-	if node, exists := m.nodes[req.URL]; exists {
-		node.LastSeen = time.Now()
-		node.Load = req.Load
+	if n, ok := m.nodes[req.URL]; ok {
+		n.seen = time.Now()
+		n.load = req.Load
 	}
 	m.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
 }
 
-func (m *MasterService) handleNodes(w http.ResponseWriter, r *http.Request) {
+func (m *Master) handleNodes(w http.ResponseWriter, r *http.Request) {
 	m.mu.RLock()
 	var nodes []string
-	for url, node := range m.nodes {
-		if time.Since(node.LastSeen) < NodeTimeout {
+	for url, n := range m.nodes {
+		if time.Since(n.seen) < NodeTimeout {
 			nodes = append(nodes, url)
 		}
 	}
 	m.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(NodesResponse{Nodes: nodes})
+	json.NewEncoder(w).Encode(nodesResp{Nodes: nodes})
 }
 
-func (m *MasterService) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (m *Master) handleHealth(w http.ResponseWriter, r *http.Request) {
 	m.mu.RLock()
-	activeNodes := 0
-	for _, node := range m.nodes {
-		if time.Since(node.LastSeen) < NodeTimeout {
-			activeNodes++
+	active := 0
+	for _, n := range m.nodes {
+		if time.Since(n.seen) < NodeTimeout {
+			active++
 		}
 	}
 	m.mu.RUnlock()
 
-	health := map[string]interface{}{
-		"status": "healthy",
-		"nodes":  activeNodes,
+	h := map[string]any{
+		"status": "ok",
+		"nodes":  active,
 		"role":   "master",
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(health)
+	json.NewEncoder(w).Encode(h)
 }
 
-func (m *MasterService) pruneDeadNodes() {
-	ticker := time.NewTicker(HeartbeatInterval * 2)
+func (m *Master) pruner() {
+	ticker := time.NewTicker(Heartbeat * 2)
 	for range ticker.C {
 		m.mu.Lock()
-		for url, node := range m.nodes {
-			if time.Since(node.LastSeen) > NodeTimeout {
+		for url, n := range m.nodes {
+			if time.Since(n.seen) > NodeTimeout {
 				delete(m.nodes, url)
-				log.Printf("Worker removed (timeout): %s", url)
+				log.Printf("removed: %s", url)
 			}
 		}
 		m.mu.Unlock()

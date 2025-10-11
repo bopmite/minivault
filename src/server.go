@@ -8,92 +8,67 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-type Response struct {
-	Success bool            `json:"success"`
-	Data    json.RawMessage `json:"data,omitempty"`
-	Error   string          `json:"error,omitempty"`
-}
-
-type ValueRequest struct {
-	Value json.RawMessage `json:"value"`
-}
-
-type HealthResponse struct {
-	Status     string `json:"status"`
-	Nodes      int    `json:"nodes"`
-	Keys       int64  `json:"keys"`
-	Size       int64  `json:"size"`
-	Memory     uint64 `json:"memory_mb"`
-	Goroutines int    `json:"goroutines"`
-}
-
 type RateLimiter struct {
-	mu       sync.Mutex
-	tokens   float64
-	rate     float64
-	capacity float64
-	last     time.Time
+	tokens   atomic.Uint64
+	rate     uint64
+	capacity uint64
+	last     atomic.Int64
 }
 
-func NewRateLimiter(rate float64) *RateLimiter {
+func NewRateLimiter(rate int) *RateLimiter {
 	return &RateLimiter{
-		tokens:   rate,
-		rate:     rate,
-		capacity: rate,
-		last:     time.Now(),
+		rate:     uint64(rate),
+		capacity: uint64(rate),
 	}
 }
 
 func (rl *RateLimiter) Allow() bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+	now := time.Now().UnixNano()
+	last := rl.last.Swap(now)
+	elapsed := float64(now-last) / 1e9
 
-	now := time.Now()
-	elapsed := now.Sub(rl.last).Seconds()
-	rl.last = now
-
-	rl.tokens += elapsed * rl.rate
-	if rl.tokens > rl.capacity {
-		rl.tokens = rl.capacity
+	tokens := rl.tokens.Load()
+	tokens += uint64(elapsed * float64(rl.rate))
+	if tokens > rl.capacity {
+		tokens = rl.capacity
 	}
 
-	if rl.tokens >= 1.0 {
-		rl.tokens -= 1.0
+	if tokens >= 1 {
+		rl.tokens.Store(tokens - 1)
 		return true
 	}
 
+	rl.tokens.Store(tokens)
 	return false
 }
 
 func (v *Vault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !v.limiter.Allow() {
-		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		http.Error(w, "rate limit", http.StatusTooManyRequests)
 		return
 	}
 
-	if v.cluster.authKey != "" && !v.cluster.verifyRequest(r) {
-		writeError(w, http.StatusUnauthorized, "invalid signature")
+	if v.cluster.authKey != "" && !v.cluster.verify(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestSize)
 	path := strings.TrimPrefix(r.URL.Path, "/")
 
-	if path == "_sync" {
+	switch path {
+	case "_sync":
 		v.handleSync(w, r)
 		return
-	}
-
-	if path == "health" {
+	case "health":
 		v.handleHealth(w, r)
 		return
-	}
-
-	if path == "" {
-		writeError(w, http.StatusBadRequest, "key required")
+	case "":
+		http.Error(w, "key required", http.StatusBadRequest)
 		return
 	}
 
@@ -107,135 +82,146 @@ func (v *Vault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		v.handleDelete(w, r, path)
 	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func (v *Vault) handleGet(w http.ResponseWriter, r *http.Request, key string) {
-	value, err := v.storage.Get(key)
+func (v *Vault) handleGet(w http.ResponseWriter, _ *http.Request, key string) {
+	data, err := v.storage.Get(key)
 	if err == nil {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.WriteHeader(http.StatusOK)
-		w.Write(value)
+		w.Write(data)
 		return
 	}
 
-	value, err = v.cluster.QuorumRead(key)
+	data, err = v.cluster.read(key)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "not found")
+		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)
-	w.Write(value)
+	w.Write(data)
 }
 
 func (v *Vault) handlePost(w http.ResponseWriter, r *http.Request, key string) {
 	if v.storage.Exists(key) {
-		writeError(w, http.StatusConflict, "key exists")
+		http.Error(w, "exists", http.StatusConflict)
 		return
 	}
 
-	value, err := extractValue(r)
+	data, err := readBody(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer putbuf(data)
+
+	if err := v.cluster.write(key, data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	if err := v.cluster.QuorumWrite(key, value); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	writeSuccess(w, http.StatusCreated, nil)
+	w.WriteHeader(http.StatusCreated)
 }
 
 func (v *Vault) handlePut(w http.ResponseWriter, r *http.Request, key string) {
-	value, err := extractValue(r)
+	data, err := readBody(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer putbuf(data)
+
+	if err := v.cluster.write(key, data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	if err := v.cluster.QuorumWrite(key, value); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	writeSuccess(w, http.StatusOK, nil)
+	w.WriteHeader(http.StatusOK)
 }
 
-func (v *Vault) handleDelete(w http.ResponseWriter, r *http.Request, key string) {
+func (v *Vault) handleDelete(w http.ResponseWriter, _ *http.Request, key string) {
 	v.storage.Delete(key)
 
-	nodes := v.cluster.rendezvousHash(key, ReplicationFactor)
+	nodes := v.cluster.hash(key, ReplicaCount)
 	for _, node := range nodes {
 		if node != v.cluster.self {
 			go v.sendDelete(node, key)
 		}
 	}
 
-	writeSuccess(w, http.StatusOK, nil)
+	w.WriteHeader(http.StatusOK)
+}
+
+type syncMsg struct {
+	Key  string `json:"key"`
+	Data []byte `json:"data"`
+	Hash uint64 `json:"hash"`
 }
 
 func (v *Vault) handleSync(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid body")
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
-	var msg SyncMessage
+	var msg syncMsg
 	if err := json.Unmarshal(body, &msg); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
 
-	if computeHash(msg.Value) != msg.Hash {
-		writeError(w, http.StatusBadRequest, "hash mismatch")
+	if hash64(msg.Data) != msg.Hash {
+		http.Error(w, "hash mismatch", http.StatusBadRequest)
 		return
 	}
 
-	if err := v.storage.Set(msg.Key, msg.Value); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if err := v.storage.Set(msg.Key, msg.Data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	writeSuccess(w, http.StatusOK, nil)
+	w.WriteHeader(http.StatusOK)
 }
 
-func (v *Vault) handleHealth(w http.ResponseWriter, r *http.Request) {
+type healthResp struct {
+	Status string `json:"status"`
+	Nodes  int    `json:"nodes"`
+	Keys   int64  `json:"keys"`
+	Size   int64  `json:"size"`
+	Memory uint64 `json:"memory_mb"`
+	GoRs   int    `json:"goroutines"`
+}
+
+func (v *Vault) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
-	nodes := 0
-	v.cluster.nodes.Range(func(_, _ interface{}) bool {
-		nodes++
-		return true
-	})
-
-	health := HealthResponse{
-		Status:     "healthy",
-		Nodes:      nodes,
-		Keys:       v.storage.Count(),
-		Size:       v.storage.size.Load(),
-		Memory:     m.Alloc / 1024 / 1024,
-		Goroutines: runtime.NumGoroutine(),
+	resp := healthResp{
+		Status: "ok",
+		Nodes:  v.cluster.count(),
+		Keys:   v.storage.Count(),
+		Size:   v.storage.size.Load(),
+		Memory: m.Alloc / 1024 / 1024,
+		GoRs:   runtime.NumGoroutine(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(health)
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (v *Vault) sendDelete(node, key string) {
 	req, _ := http.NewRequest(http.MethodDelete, node+"/"+key, nil)
-	v.cluster.signRequest(req)
+	v.cluster.sign(req)
 
 	resp, err := v.cluster.client.Do(req)
 	if err == nil {
@@ -243,34 +229,28 @@ func (v *Vault) sendDelete(node, key string) {
 	}
 }
 
-func extractValue(r *http.Request) ([]byte, error) {
-	body, err := io.ReadAll(r.Body)
+var bodyPool = sync.Pool{New: func() any { return make([]byte, 0, 16384) }}
+
+func readBody(r *http.Request) ([]byte, error) {
+	buf := bodyPool.Get().([]byte)[:0]
+
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
+		bodyPool.Put(buf)
 		return nil, err
 	}
 
-	if len(body) == 0 {
-		return nil, fmt.Errorf("empty body")
+	if len(data) == 0 {
+		bodyPool.Put(buf)
+		return nil, fmt.Errorf("empty")
 	}
 
-	if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
-		var req ValueRequest
-		if err := json.Unmarshal(body, &req); err == nil && len(req.Value) > 0 {
+	if ct := r.Header.Get("Content-Type"); strings.Contains(ct, "application/json") {
+		var req struct{ Value json.RawMessage }
+		if err := json.Unmarshal(data, &req); err == nil && len(req.Value) > 0 {
 			return []byte(req.Value), nil
 		}
 	}
 
-	return body, nil
-}
-
-func writeError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(Response{Success: false, Error: msg})
-}
-
-func writeSuccess(w http.ResponseWriter, status int, data json.RawMessage) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(Response{Success: true, Data: data})
+	return data, nil
 }

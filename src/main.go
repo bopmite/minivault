@@ -5,43 +5,43 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime"
 	"time"
 )
 
 const (
-	MaxValueSize         = 100 * 1024 * 1024
-	MaxRequestSize       = 100 * 1024 * 1024
-	WriteTimeout         = 30 * time.Second
-	ReadTimeout          = 30 * time.Second
-	WorkerPoolSize       = 100
-	RateLimit            = 10000
-	HeartbeatInterval    = 10 * time.Second
-	NodeTimeout          = 35 * time.Second
-	ReplicationFactor    = 3
-	CompressionThreshold = 4096
+	MaxValueSize   = 100 * 1024 * 1024
+	MaxRequestSize = 100 * 1024 * 1024
+	MaxCacheSize   = 512 * 1024 * 1024
+	WriteTimeout   = 30 * time.Second
+	ReadTimeout    = 30 * time.Second
+	WorkerPool     = 100
+	RateLimit      = 100000
+	Heartbeat      = 10 * time.Second
+	NodeTimeout    = 35 * time.Second
+	ReplicaCount   = 3
 )
 
 type Vault struct {
-	storage  *Storage
-	cluster  *Cluster
-	limiter  *RateLimiter
-	isMaster bool
+	storage *Storage
+	cluster *Cluster
+	limiter *RateLimiter
 }
 
-var vault *Vault
-
 func main() {
-	mode := flag.String("mode", "worker", "Mode: worker or master")
-	port := flag.Int("port", 3000, "Port to listen on")
-	publicURL := flag.String("public-url", "", "Public URL for this worker")
-	masterURL := flag.String("master", "", "Master server URL")
-	dataDir := flag.String("data", "/data", "Data directory")
-	volumes := flag.String("volumes", "", "Comma-separated volume URLs (master mode)")
-	authKey := flag.String("auth", "", "Shared secret for cluster auth")
+	mode := flag.String("mode", "worker", "worker or master")
+	port := flag.Int("port", 3000, "port")
+	pubURL := flag.String("public-url", "", "public url")
+	master := flag.String("master", "", "master url")
+	dataDir := flag.String("data", "/data", "data dir")
+	volumes := flag.String("volumes", "", "volume urls")
+	authKey := flag.String("auth", "", "auth key")
 	flag.Parse()
 
-	if *publicURL == "" {
-		*publicURL = fmt.Sprintf("http://localhost:%d", *port)
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	if *pubURL == "" {
+		*pubURL = fmt.Sprintf("http://localhost:%d", *port)
 	}
 
 	if *mode == "master" {
@@ -51,25 +51,21 @@ func main() {
 
 	storage, err := NewStorage(*dataDir)
 	if err != nil {
-		log.Fatalf("Failed to initialize storage: %v", err)
+		log.Fatal(err)
+	}
+	defer storage.Close()
+
+	vault := &Vault{
+		storage: storage,
+		cluster: NewCluster(*pubURL, *master, *authKey, storage),
+		limiter: NewRateLimiter(RateLimit),
 	}
 
-	cluster := NewCluster(*publicURL, *masterURL, *authKey, storage)
-
-	vault = &Vault{
-		storage:  storage,
-		cluster:  cluster,
-		limiter:  NewRateLimiter(RateLimit),
-		isMaster: false,
+	if *master != "" {
+		go vault.cluster.start()
 	}
 
-	if *masterURL != "" {
-		go cluster.registerWithMaster()
-		go cluster.heartbeatLoop()
-		go cluster.syncNodesLoop()
-	}
-
-	server := &http.Server{
+	srv := &http.Server{
 		Addr:           fmt.Sprintf(":%d", *port),
 		Handler:        vault,
 		ReadTimeout:    ReadTimeout,
@@ -77,6 +73,6 @@ func main() {
 		MaxHeaderBytes: 1 << 20,
 	}
 
-	log.Printf("Worker starting on %s (public: %s)", server.Addr, *publicURL)
-	log.Fatal(server.ListenAndServe())
+	log.Printf("starting on %s", srv.Addr)
+	log.Fatal(srv.ListenAndServe())
 }

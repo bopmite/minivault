@@ -1,23 +1,17 @@
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"strings"
-	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Storage struct {
 	dir   string
-	cache sync.Map
-	mu    sync.RWMutex
+	cache *cache
+	wal   *wal
 	size  atomic.Int64
 }
 
@@ -26,122 +20,136 @@ func NewStorage(dir string) (*Storage, error) {
 		return nil, err
 	}
 
-	s := &Storage{dir: dir}
-	go s.loadCache()
+	w, err := newWAL(dir)
+	if err != nil {
+		return nil, err
+	}
 
+	s := &Storage{
+		dir:   dir,
+		cache: newCache(100000),
+		wal:   w,
+	}
+
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+
+	go s.compactor()
 	return s, nil
 }
 
-func (s *Storage) loadCache() {
-	_ = filepath.Walk(s.dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || strings.HasSuffix(path, ".tmp") {
+func (s *Storage) load() error {
+	return filepath.Walk(s.dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || filepath.Ext(path) == ".log" || filepath.Ext(path) == ".tmp" {
 			return nil
 		}
 
-		key := filepath.Base(path)
-		if strings.HasSuffix(key, ".gz") {
-			key = key[:len(key)-3]
+		h := parseHex(filepath.Base(path))
+		if data, err := os.ReadFile(path); err == nil {
+			s.cache.set(h, data)
+			s.size.Add(info.Size())
 		}
-
-		s.cache.Store(key, true)
-		s.size.Add(info.Size())
 		return nil
 	})
 }
 
 func (s *Storage) Set(key string, value []byte) error {
 	if len(value) > MaxValueSize {
-		return fmt.Errorf("value too large")
+		return fmt.Errorf("too large")
 	}
 
-	hash := hashKey(key)
-	path := filepath.Join(s.dir, hash)
-	tmpPath := path + ".tmp"
+	h := hash64str(key)
+	s.wal.append(h, value)
+	s.cache.set(h, value)
+	s.size.Add(int64(len(value)))
 
-	data := value
-	if len(value) > CompressionThreshold {
-		buf := new(bytes.Buffer)
-		gw := gzip.NewWriter(buf)
-		if _, err := gw.Write(value); err == nil {
-			gw.Close()
-			if buf.Len() < len(value) {
-				data = buf.Bytes()
-				path += ".gz"
-				tmpPath += ".gz"
-			}
-		}
+	if s.size.Load() > MaxCacheSize {
+		s.cache.evict(MaxCacheSize)
 	}
-
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-	f.Close()
-
-	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-
-	s.cache.Store(key, true)
-	s.size.Add(int64(len(data)))
 
 	return nil
 }
 
 func (s *Storage) Get(key string) ([]byte, error) {
-	hash := hashKey(key)
+	h := hash64str(key)
 
-	path := filepath.Join(s.dir, hash+".gz")
-	data, err := os.ReadFile(path)
-	if err == nil {
-		gr, err := gzip.NewReader(bytes.NewReader(data))
-		if err != nil {
-			return nil, err
-		}
-		defer gr.Close()
-		return io.ReadAll(gr)
+	if data, ok := s.cache.get(h); ok {
+		return data, nil
 	}
 
-	path = filepath.Join(s.dir, hash)
-	return os.ReadFile(path)
+	path := filepath.Join(s.dir, fmtHex(h))
+	data, err := os.ReadFile(path)
+	if err == nil {
+		s.cache.set(h, data)
+		return data, nil
+	}
+
+	return nil, fmt.Errorf("not found")
 }
 
 func (s *Storage) Delete(key string) error {
-	hash := hashKey(key)
-	os.Remove(filepath.Join(s.dir, hash))
-	os.Remove(filepath.Join(s.dir, hash+".gz"))
-	s.cache.Delete(key)
+	h := hash64str(key)
+	s.cache.del(h)
+	os.Remove(filepath.Join(s.dir, fmtHex(h)))
 	return nil
 }
 
 func (s *Storage) Exists(key string) bool {
-	_, ok := s.cache.Load(key)
-	return ok
+	h := hash64str(key)
+	return s.cache.has(h)
 }
 
 func (s *Storage) Count() int64 {
-	count := int64(0)
-	s.cache.Range(func(_, _ interface{}) bool {
-		count++
-		return true
-	})
-	return count
+	return s.cache.items.Load()
 }
 
-func hashKey(key string) string {
-	h := sha256.Sum256([]byte(key))
-	return hex.EncodeToString(h[:])
+func (s *Storage) compactor() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.wal.compact()
+
+		// persist hot items to disk
+		for i := range s.cache.shards {
+			shard := s.cache.shards[i]
+			shard.mu.RLock()
+			for h, e := range shard.m {
+				if atomic.LoadUint32(&e.hits) > 10 {
+					path := filepath.Join(s.dir, fmtHex(h))
+					os.WriteFile(path, e.data, 0644)
+				}
+			}
+			shard.mu.RUnlock()
+		}
+	}
+}
+
+func (s *Storage) Close() {
+	s.wal.close()
+}
+
+func fmtHex(h uint64) string {
+	const hex = "0123456789abcdef"
+	var buf [16]byte
+	for i := 15; i >= 0; i-- {
+		buf[i] = hex[h&0xf]
+		h >>= 4
+	}
+	return string(buf[:])
+}
+
+func parseHex(s string) uint64 {
+	var h uint64
+	for i := 0; i < len(s) && i < 16; i++ {
+		h <<= 4
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			h |= uint64(c - '0')
+		} else if c >= 'a' && c <= 'f' {
+			h |= uint64(c - 'a' + 10)
+		}
+	}
+	return h
 }
