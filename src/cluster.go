@@ -24,6 +24,7 @@ type Cluster struct {
 	client  *http.Client
 	workers chan struct{} // Goroutine pool
 	authKey string
+	storage *Storage
 }
 
 type NodeInfo struct {
@@ -47,11 +48,12 @@ type NodesResponse struct {
 	Nodes []string `json:"nodes"`
 }
 
-func NewCluster(self, master, authKey string) *Cluster {
+func NewCluster(self, master, authKey string, storage *Storage) *Cluster {
 	c := &Cluster{
 		self:    self,
 		master:  master,
 		authKey: authKey,
+		storage: storage,
 		workers: make(chan struct{}, WorkerPoolSize),
 		client: &http.Client{
 			Timeout: WriteTimeout,
@@ -95,8 +97,27 @@ func (c *Cluster) registerWithMaster() {
 func (c *Cluster) heartbeatLoop() {
 	ticker := time.NewTicker(HeartbeatInterval)
 	for range ticker.C {
-		c.registerWithMaster()
+		c.sendHeartbeat()
 	}
+}
+
+func (c *Cluster) sendHeartbeat() {
+	if c.master == "" {
+		return
+	}
+
+	load := float64(runtime.NumGoroutine())
+	data, _ := json.Marshal(RegisterRequest{URL: c.self, Load: load})
+
+	req, _ := http.NewRequest(http.MethodPost, c.master+"/heartbeat", bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	c.signRequest(req)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
 }
 
 func (c *Cluster) syncNodesLoop() {
@@ -182,7 +203,7 @@ func (c *Cluster) QuorumWrite(key string, value []byte) error {
 
 			var err error
 			if n == c.self {
-				err = vault.storage.Set(key, value)
+				err = c.storage.Set(key, value)
 			} else {
 				err = c.syncWrite(n, key, value)
 			}
@@ -216,14 +237,14 @@ func (c *Cluster) QuorumRead(key string) ([]byte, error) {
 		var err error
 
 		if node == c.self {
-			value, err = vault.storage.Get(key)
+			value, err = c.storage.Get(key)
 		} else {
 			value, err = c.fetchFrom(node, key)
 		}
 
 		if err == nil {
 			if node != c.self {
-				vault.storage.Set(key, value)
+				_ = c.storage.Set(key, value)
 			}
 			return value, nil
 		}

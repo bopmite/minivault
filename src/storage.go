@@ -33,7 +33,7 @@ func NewStorage(dir string) (*Storage, error) {
 }
 
 func (s *Storage) loadCache() {
-	filepath.Walk(s.dir, func(path string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(s.dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || strings.HasSuffix(path, ".tmp") {
 			return nil
 		}

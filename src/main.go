@@ -54,7 +54,7 @@ func main() {
 		log.Fatalf("Failed to initialize storage: %v", err)
 	}
 
-	cluster := NewCluster(*publicURL, *masterURL, *authKey)
+	cluster := NewCluster(*publicURL, *masterURL, *authKey, storage)
 
 	vault = &Vault{
 		storage:  storage,
