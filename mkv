@@ -3,7 +3,7 @@ set -e
 
 VOLUMES="${VOLUMES:-localhost:3001,localhost:3002,localhost:3003}"
 PORT="${PORT:-3000}"
-DATA="${DATA:-./indexdb}"
+DATA="${DATA:-./data}"
 
 if [ ! -f "./minivault" ]; then
     echo "Building minivault..."

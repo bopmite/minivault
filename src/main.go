@@ -8,47 +8,75 @@ import (
 	"time"
 )
 
+const (
+	MaxValueSize         = 100 * 1024 * 1024
+	MaxRequestSize       = 100 * 1024 * 1024
+	WriteTimeout         = 30 * time.Second
+	ReadTimeout          = 30 * time.Second
+	WorkerPoolSize       = 100
+	RateLimit            = 10000
+	HeartbeatInterval    = 10 * time.Second
+	NodeTimeout          = 35 * time.Second
+	ReplicationFactor    = 3
+	CompressionThreshold = 4096
+)
+
 type Vault struct {
-	selfURL string
-	cluster *Cluster
+	storage  *Storage
+	cluster  *Cluster
+	limiter  *RateLimiter
+	isMaster bool
 }
+
+var vault *Vault
 
 func main() {
 	mode := flag.String("mode", "worker", "Mode: worker or master")
 	port := flag.Int("port", 3000, "Port to listen on")
-	publicURL := flag.String("public-url", "", "Public URL for this worker (required in worker mode)")
-	masterURL := flag.String("master", "", "Master server URL (required in worker mode)")
+	publicURL := flag.String("public-url", "", "Public URL for this worker")
+	masterURL := flag.String("master", "", "Master server URL")
 	dataDir := flag.String("data", "./data", "Data directory")
-	volumes := flag.String("volumes", "", "Comma-separated list of volume URLs (master mode only)")
+	volumes := flag.String("volumes", "", "Comma-separated volume URLs (master mode)")
+	authKey := flag.String("auth", "", "Shared secret for cluster auth")
 	flag.Parse()
+
+	if *publicURL == "" {
+		*publicURL = fmt.Sprintf("http://localhost:%d", *port)
+	}
 
 	if *mode == "master" {
 		runMaster(*port, *volumes)
 		return
 	}
 
-	if *publicURL == "" {
-		*publicURL = fmt.Sprintf("http://localhost:%d", *port)
+	storage, err := NewStorage(*dataDir)
+	if err != nil {
+		log.Fatalf("Failed to initialize storage: %v", err)
 	}
 
-	InitStorage(*dataDir)
-	cluster := InitCluster(*publicURL, *masterURL)
+	cluster := NewCluster(*publicURL, *masterURL, *authKey)
 
-	v := &Vault{
-		selfURL: *publicURL,
-		cluster: cluster,
+	vault = &Vault{
+		storage:  storage,
+		cluster:  cluster,
+		limiter:  NewRateLimiter(RateLimit),
+		isMaster: false,
 	}
 
-	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 1000
-	http.DefaultTransport.(*http.Transport).MaxConnsPerHost = 1000
+	if *masterURL != "" {
+		go cluster.registerWithMaster()
+		go cluster.heartbeatLoop()
+		go cluster.syncNodesLoop()
+	}
 
 	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", *port),
-		Handler:      v,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Addr:           fmt.Sprintf(":%d", *port),
+		Handler:        vault,
+		ReadTimeout:    ReadTimeout,
+		WriteTimeout:   WriteTimeout,
+		MaxHeaderBytes: 1 << 20,
 	}
 
-	log.Printf("Worker starting on %s (public: %s, master: %s)", fmt.Sprintf(":%d", *port), *publicURL, *masterURL)
+	log.Printf("Worker starting on %s (public: %s)", server.Addr, *publicURL)
 	log.Fatal(server.ListenAndServe())
 }
