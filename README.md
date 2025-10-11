@@ -98,16 +98,6 @@ curl -X PUT http://localhost:3000/file.jpg \
   -d "{\"value\": \"$(base64 file.jpg)\"}"
 ```
 
-## Production Deployment
-
-```bash
-git clone https://github.com/bopmite/minivault
-cd minivault
-sudo ./setup.sh --domain yourdomain.com --email your@email.com
-```
-
-See [DEPLOY.md](DEPLOY.md) for complete deployment documentation.
-
 ## Docker
 
 ```bash
