@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
-	"io"
 	"log"
 	"net/http"
 	"runtime"
@@ -50,7 +49,7 @@ func NewCluster(self, master, authKey string, storage *Storage) *Cluster {
 		},
 	}
 
-	for i := 0; i < WorkerPool; i++ {
+	for range WorkerPool {
 		c.workers <- struct{}{}
 	}
 
@@ -223,7 +222,7 @@ func (c *Cluster) write(key string, data []byte) error {
 	}
 
 	ok := 0
-	for i := 0; i < len(nodes); i++ {
+	for range nodes {
 		select {
 		case err := <-results:
 			if err == nil {
@@ -303,6 +302,7 @@ func (c *Cluster) fetch(node, key string) ([]byte, error) {
 		return nil, err
 	}
 
+	req.Header.Set("X-Cluster-Fetch", "true")
 	c.sign(req)
 
 	resp, err := c.client.Do(req)
@@ -315,7 +315,20 @@ func (c *Cluster) fetch(node, key string) ([]byte, error) {
 		return nil, fmt.Errorf("fetch failed: %d", resp.StatusCode)
 	}
 
-	return io.ReadAll(resp.Body)
+	var apiResp struct {
+		Success bool            `json:"success"`
+		Data    json.RawMessage `json:"data"`
+		Error   string          `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return nil, err
+	}
+
+	if !apiResp.Success {
+		return nil, fmt.Errorf("fetch failed: %s", apiResp.Error)
+	}
+
+	return apiResp.Data, nil
 }
 
 func (c *Cluster) sign(req *http.Request) {

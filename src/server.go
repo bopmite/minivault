@@ -12,6 +12,12 @@ import (
 	"time"
 )
 
+type apiResponse struct {
+	Success bool            `json:"success"`
+	Data    json.RawMessage `json:"data,omitempty"`
+	Error   string          `json:"error,omitempty"`
+}
+
 type RateLimiter struct {
 	tokens   atomic.Uint64
 	rate     uint64
@@ -46,14 +52,25 @@ func (rl *RateLimiter) Allow() bool {
 	return false
 }
 
+func jsonError(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(apiResponse{Success: false, Error: msg})
+}
+
+func jsonSuccess(w http.ResponseWriter, data []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(apiResponse{Success: true, Data: data})
+}
+
 func (v *Vault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !v.limiter.Allow() {
-		http.Error(w, "rate limit", http.StatusTooManyRequests)
+		jsonError(w, "rate limit", http.StatusTooManyRequests)
 		return
 	}
 
 	if v.cluster.authKey != "" && !v.cluster.verify(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -68,7 +85,7 @@ func (v *Vault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		v.handleHealth(w, r)
 		return
 	case "":
-		http.Error(w, "key required", http.StatusBadRequest)
+		jsonError(w, "key required", http.StatusBadRequest)
 		return
 	}
 
@@ -82,65 +99,66 @@ func (v *Vault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		v.handleDelete(w, r, path)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func (v *Vault) handleGet(w http.ResponseWriter, _ *http.Request, key string) {
+func (v *Vault) handleGet(w http.ResponseWriter, r *http.Request, key string) {
 	data, err := v.storage.Get(key)
 	if err == nil {
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.WriteHeader(http.StatusOK)
-		w.Write(data)
+		jsonSuccess(w, data)
 		return
 	}
 
-	data, err = v.cluster.read(key)
-	if err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
+	if r.Header.Get("X-Cluster-Fetch") == "" {
+		data, err = v.cluster.read(key)
+		if err == nil {
+			jsonSuccess(w, data)
+			return
+		}
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.WriteHeader(http.StatusOK)
-	w.Write(data)
+	jsonError(w, "not found", http.StatusNotFound)
 }
 
 func (v *Vault) handlePost(w http.ResponseWriter, r *http.Request, key string) {
 	if v.storage.Exists(key) {
-		http.Error(w, "exists", http.StatusConflict)
+		jsonError(w, "exists", http.StatusConflict)
 		return
 	}
 
 	data, err := readBody(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	defer putbuf(data)
 
 	if err := v.cluster.write(key, data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(apiResponse{Success: true})
 }
 
 func (v *Vault) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 	data, err := readBody(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	defer putbuf(data)
 
 	if err := v.cluster.write(key, data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(apiResponse{Success: true})
 }
 
 func (v *Vault) handleDelete(w http.ResponseWriter, _ *http.Request, key string) {
@@ -153,7 +171,8 @@ func (v *Vault) handleDelete(w http.ResponseWriter, _ *http.Request, key string)
 		}
 	}
 
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(apiResponse{Success: true})
 }
 
 type syncMsg struct {
@@ -164,33 +183,34 @@ type syncMsg struct {
 
 func (v *Vault) handleSync(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		jsonError(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
 	var msg syncMsg
 	if err := json.Unmarshal(body, &msg); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
+		jsonError(w, "bad json", http.StatusBadRequest)
 		return
 	}
 
 	if hash64(msg.Data) != msg.Hash {
-		http.Error(w, "hash mismatch", http.StatusBadRequest)
+		jsonError(w, "hash mismatch", http.StatusBadRequest)
 		return
 	}
 
 	if err := v.storage.Set(msg.Key, msg.Data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(apiResponse{Success: true})
 }
 
 type healthResp struct {

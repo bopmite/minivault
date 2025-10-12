@@ -104,12 +104,6 @@ func (w *wal) flushLocked() {
 	w.batch = w.batch[:0]
 }
 
-func (w *wal) flush() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.flushLocked()
-}
-
 func (w *wal) close() {
 	close(w.done)
 }
