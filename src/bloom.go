@@ -8,10 +8,7 @@ type bloom struct {
 }
 
 func newBloom(n int) *bloom {
-	size := n * 10 / 64
-	if size < 1024 {
-		size = 1024
-	}
+	size := max(n * 10 / 64, 1024)
 	return &bloom{bits: make([]uint64, size), k: 3}
 }
 

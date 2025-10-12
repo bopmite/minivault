@@ -112,7 +112,7 @@ func (c *cache) evict(max int64) {
 		return
 	}
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		min := i
 		for j := i + 1; j < len(all); j++ {
 			if all[j].hits < all[min].hits {

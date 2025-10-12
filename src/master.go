@@ -19,7 +19,7 @@ func runMaster(port int, volumes string) {
 	m := &Master{nodes: make(map[string]*node)}
 
 	if volumes != "" {
-		for _, v := range strings.Split(volumes, ",") {
+		for v := range strings.SplitSeq(volumes, ",") {
 			v = strings.TrimSpace(v)
 			if v != "" {
 				if !strings.HasPrefix(v, "http") {
