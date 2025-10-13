@@ -167,7 +167,11 @@ func (v *Vault) handleDelete(w http.ResponseWriter, _ *http.Request, key string)
 	nodes := v.cluster.hash(key, ReplicaCount)
 	for _, node := range nodes {
 		if node != v.cluster.self {
-			go v.sendDelete(node, key)
+			<-v.cluster.workers
+			go func(n string) {
+				defer func() { v.cluster.workers <- struct{}{} }()
+				v.sendDelete(n, key)
+			}(node)
 		}
 	}
 

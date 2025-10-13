@@ -42,8 +42,8 @@ func NewCluster(self, master, authKey string, storage *Storage) *Cluster {
 		client: &http.Client{
 			Timeout: WriteTimeout,
 			Transport: &http.Transport{
-				MaxIdleConns:        200,
-				MaxIdleConnsPerHost: 50,
+				MaxIdleConns:        50,
+				MaxIdleConnsPerHost: 10,
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},

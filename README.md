@@ -35,29 +35,42 @@ Recreation of George Hotz's [minikeyvalue](https://github.com/geohot/minikeyvalu
 
 ## Quick Start
 
-### Local Cluster (easiest)
+### Local Cluster
 
 ```bash
-# Start master with 3 volumes
-VOLUMES=localhost:3001,localhost:3002,localhost:3003 PORT=3000 ./mkv &
-
-# Start 3 volumes
-PORT=3001 MASTER=http://localhost:3000 ./volume /tmp/volume1 &
-PORT=3002 MASTER=http://localhost:3000 ./volume /tmp/volume2 &
-PORT=3003 MASTER=http://localhost:3000 ./volume /tmp/volume3 &
-
-# Wait for cluster sync (5s)
-sleep 6
-
-# Test it
-curl -X POST http://localhost:3001/test -d '{"value": "hello"}' -H "Content-Type: application/json"
-curl http://localhost:3002/test # replicated across volume 1 -> 2
+./scripts/startup.sh
 ```
+
+Starts master on port 3000 and 3 volumes on ports 3001-3003.
+
+**Options:**
+- `--master-port <port>` - Master server port (default: 3000)
+- `--volume-ports <ports>` - Comma-separated volume ports (default: 3001,3002,3003)
+- `--data-dir <path>` - Data directory (default: ./data)
+- `--auth <key>` - Authentication key (optional)
+- `--binary <path>` - Binary path (default: ./minivault)
+
+**Examples:**
+```bash
+./scripts/startup.sh --volume-ports 4000,4001,4002,4003,4004
+
+./scripts/startup.sh --master-port 8080 --volume-ports 8081,8082,8083
+
+./scripts/startup.sh --auth mykey123 --data-dir /tmp/vault --volume-ports 5000,5001
+```
+
+**Test:**
+```bash
+curl -X POST http://localhost:3001/test -d '{"value": "hello"}' -H "Content-Type: application/json"
+curl http://localhost:3002/test
+```
+
+Press Ctrl+C to stop all services.
 
 ### Single Node
 
 ```bash
-./volume /tmp/data
+./minivault -port 3000 -data ./data
 ```
 
 ### Geo-Distributed Cluster
@@ -117,6 +130,12 @@ docker run -p 3000:3000 minivault:latest
 docker-compose up -d
 ```
 
+## Build
+
+```bash
+go build -o minivault src/*.go
+```
+
 ## Flags
 
 **Worker Mode (default):**
@@ -131,34 +150,23 @@ docker-compose up -d
 
 ## Performance
 
-*(benchmarked with every commit)*
-
 **Test Environment:**
-- CPU: Intel Core i7-12700K (12 cores, 20 threads)
-- RAM: 16GB DDR5
+- CPU: AMD Ryzen 7 PRO 7840U (16 cores)
+- RAM: 64GB DDR5
 - OS: Linux 6.6.87 (WSL2)
 - Go: 1.25.2
 
 **Storage Layer (WAL + Cache + Bloom):**
-- Write 1KB: 390ns/op (2.6 GB/s)
-- Write 100KB: 388ns/op (264 GB/s)
-- Write 1MB: 383ns/op (2.7 TB/s)
-- Read 1KB (cache hit): 60ns/op (17 GB/s)
-- Read 100KB (cache hit): 48ns/op (2.1 TB/s)
-- Read 1MB (cache hit): 54ns/op (19.3 TB/s)
+- Write 1KB: 998ns/op (1.0 GB/s, **~1M ops/sec**)
+- Write 10KB: 1085ns/op (9.4 GB/s, **920k ops/sec**)
+- Write 100KB: 954ns/op (107 GB/s, **1M ops/sec**)
+- Write 1MB: 1034ns/op (1014 GB/s, **967k ops/sec**)
+- Cache Hit: 63ns/op (16.3 GB/s, **15.9M ops/sec**)
+- WAL Batch: 984ns/op (260 MB/s, **~1M ops/sec**)
 
-**HTTP API:**
-- PUT 1KB: 2.8μs/req (367 MB/s)
-- PUT 100KB: 101μs/req (1.0 GB/s)
-- PUT 1MB: 858μs/req (1.2 GB/s)
-- GET 1KB: 2.3μs/req (442 MB/s)
-- GET 100KB: 12.8μs/req (7.9 GB/s)
-- GET 1MB: 131μs/req (7.9 GB/s)
+**HTTP API Throughput:**
+- Sequential Writes: **155k ops/sec** (159 MB/s)
+- Sequential Reads: **235k ops/sec** (241 MB/s)
+- Concurrent Writes: **713k ops/sec** (730 MB/s)
+- Concurrent Reads: **776k ops/sec** (794 MB/s)
 
-**Throughput:**
-- Sequential Writes: 350k ops/sec
-- Sequential Reads: 457k ops/sec
-- Concurrent Writes (1KB): 1.0 GB/s (991ns/op)
-- Concurrent Reads (1KB): 1.0 GB/s (1011ns/op)
-- Cache Hit Rate: 20.2 GB/s (50ns/op)
-- WAL Batch Writes: 617 MB/s (415ns/op)

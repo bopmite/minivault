@@ -15,7 +15,7 @@ const (
 	MaxCacheSize   = 512 * 1024 * 1024
 	WriteTimeout   = 30 * time.Second
 	ReadTimeout    = 30 * time.Second
-	WorkerPool     = 100
+	WorkerPool     = 50
 	RateLimit      = 100000
 	Heartbeat      = 10 * time.Second
 	NodeTimeout    = 35 * time.Second
