@@ -107,22 +107,3 @@ func (w *wal) flushLocked() {
 func (w *wal) close() {
 	close(w.done)
 }
-
-func (w *wal) compact() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	old := w.file
-	path := filepath.Join(w.dir, "wal.log")
-	temp := path + ".tmp"
-
-	f, err := os.Create(temp)
-	if err != nil {
-		return err
-	}
-
-	w.file = f
-	old.Close()
-	os.Remove(path)
-	return os.Rename(temp, path)
-}

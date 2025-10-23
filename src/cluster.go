@@ -1,26 +1,19 @@
 package main
 
 import (
-	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"hash/crc32"
-	"log"
-	"net/http"
-	"runtime"
+	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
 type Cluster struct {
 	self    string
-	master  string
 	nodes   sync.Map
-	client  *http.Client
+	client  *BinaryClient
 	workers chan struct{}
 	authKey string
 	storage *Storage
@@ -29,24 +22,15 @@ type Cluster struct {
 type node struct {
 	url  string
 	seen time.Time
-	load float64
 }
 
-func NewCluster(self, master, authKey string, storage *Storage) *Cluster {
+func NewCluster(self, authKey string, storage *Storage) *Cluster {
 	c := &Cluster{
 		self:    self,
-		master:  master,
 		authKey: authKey,
 		storage: storage,
 		workers: make(chan struct{}, WorkerPool),
-		client: &http.Client{
-			Timeout: WriteTimeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        50,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
+		client:  NewBinaryClient(),
 	}
 
 	for range WorkerPool {
@@ -54,94 +38,18 @@ func NewCluster(self, master, authKey string, storage *Storage) *Cluster {
 	}
 
 	c.nodes.Store(self, &node{url: self, seen: time.Now()})
+
+	nodes := os.Getenv("CLUSTER_NODES")
+	if nodes != "" {
+		for _, n := range strings.Split(nodes, ",") {
+			n = strings.TrimSpace(n)
+			if n != "" && n != self {
+				c.nodes.Store(n, &node{url: n, seen: time.Now()})
+			}
+		}
+	}
+
 	return c
-}
-
-func (c *Cluster) start() {
-	c.register()
-
-	go func() {
-		ticker := time.NewTicker(Heartbeat)
-		defer ticker.Stop()
-		for range ticker.C {
-			c.heartbeat()
-		}
-	}()
-
-	go func() {
-		ticker := time.NewTicker(Heartbeat)
-		defer ticker.Stop()
-		for range ticker.C {
-			c.syncNodes()
-		}
-	}()
-}
-
-type regReq struct {
-	URL  string  `json:"url"`
-	Load float64 `json:"load"`
-}
-
-func (c *Cluster) register() {
-	if c.master == "" {
-		return
-	}
-
-	load := float64(runtime.NumGoroutine())
-	data, _ := json.Marshal(regReq{URL: c.self, Load: load})
-
-	req, _ := http.NewRequest(http.MethodPost, c.master+"/register", bytes.NewReader(data))
-	req.Header.Set("Content-Type", "application/json")
-	c.sign(req)
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		log.Printf("register failed: %v", err)
-		return
-	}
-	resp.Body.Close()
-}
-
-func (c *Cluster) heartbeat() {
-	if c.master == "" {
-		return
-	}
-
-	load := float64(runtime.NumGoroutine())
-	data, _ := json.Marshal(regReq{URL: c.self, Load: load})
-
-	req, _ := http.NewRequest(http.MethodPost, c.master+"/heartbeat", bytes.NewReader(data))
-	req.Header.Set("Content-Type", "application/json")
-	c.sign(req)
-
-	resp, err := c.client.Do(req)
-	if err == nil {
-		resp.Body.Close()
-	}
-}
-
-type nodesResp struct {
-	Nodes []string `json:"nodes"`
-}
-
-func (c *Cluster) syncNodes() {
-	req, _ := http.NewRequest(http.MethodGet, c.master+"/nodes", nil)
-	c.sign(req)
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	var nr nodesResp
-	json.NewDecoder(resp.Body).Decode(&nr)
-
-	for _, url := range nr.Nodes {
-		if _, ok := c.nodes.Load(url); !ok {
-			c.nodes.Store(url, &node{url: url, seen: time.Now()})
-		}
-	}
 }
 
 func (c *Cluster) getNodes() []string {
@@ -151,15 +59,6 @@ func (c *Cluster) getNodes() []string {
 		return true
 	})
 	return nodes
-}
-
-func (c *Cluster) count() int {
-	n := 0
-	c.nodes.Range(func(_, _ any) bool {
-		n++
-		return true
-	})
-	return n
 }
 
 func (c *Cluster) hash(key string, count int) []string {
@@ -215,7 +114,7 @@ func (c *Cluster) write(key string, data []byte) error {
 			if node == c.self {
 				err = c.storage.Set(key, data)
 			} else {
-				err = c.sync(node, key, data)
+				err = c.client.Sync(node, key, data)
 			}
 			results <- err
 		}(n)
@@ -249,7 +148,7 @@ func (c *Cluster) read(key string) ([]byte, error) {
 		if n == c.self {
 			data, err = c.storage.Get(key)
 		} else {
-			data, err = c.fetch(n, key)
+			data, err = c.client.Get(n, key)
 		}
 
 		if err == nil {
@@ -263,104 +162,6 @@ func (c *Cluster) read(key string) ([]byte, error) {
 	return nil, fmt.Errorf("not found")
 }
 
-func (c *Cluster) sync(node, key string, data []byte) error {
-	msg := syncMsg{
-		Key:  key,
-		Data: data,
-		Hash: hash64(data),
-	}
-
-	body, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequest(http.MethodPut, node+"/_sync", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	c.sign(req)
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("sync failed: %d", resp.StatusCode)
-	}
-
-	return nil
-}
-
-func (c *Cluster) fetch(node, key string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, node+"/"+key, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("X-Cluster-Fetch", "true")
-	c.sign(req)
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch failed: %d", resp.StatusCode)
-	}
-
-	var apiResp struct {
-		Success bool            `json:"success"`
-		Data    json.RawMessage `json:"data"`
-		Error   string          `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return nil, err
-	}
-
-	if !apiResp.Success {
-		return nil, fmt.Errorf("fetch failed: %s", apiResp.Error)
-	}
-
-	return apiResp.Data, nil
-}
-
-func (c *Cluster) sign(req *http.Request) {
-	if c.authKey == "" {
-		return
-	}
-
-	ts := fmt.Sprintf("%d", time.Now().Unix())
-	req.Header.Set("X-Timestamp", ts)
-
-	h := hmac.New(sha256.New, []byte(c.authKey))
-	h.Write([]byte(req.Method + req.URL.Path + ts))
-	sig := hex.EncodeToString(h.Sum(nil))
-
-	req.Header.Set("X-Signature", sig)
-}
-
-func (c *Cluster) verify(req *http.Request) bool {
-	if c.authKey == "" {
-		return true
-	}
-
-	ts := req.Header.Get("X-Timestamp")
-	sig := req.Header.Get("X-Signature")
-
-	if ts == "" || sig == "" {
-		return false
-	}
-
-	h := hmac.New(sha256.New, []byte(c.authKey))
-	h.Write([]byte(req.Method + req.URL.Path + ts))
-	expected := hex.EncodeToString(h.Sum(nil))
-
-	return hmac.Equal([]byte(sig), []byte(expected))
+func (c *Cluster) sendDelete(node, key string) {
+	c.client.Delete(node, key)
 }

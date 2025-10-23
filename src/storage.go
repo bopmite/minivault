@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
-	"time"
 )
 
 type Storage struct {
@@ -35,7 +34,6 @@ func NewStorage(dir string) (*Storage, error) {
 		return nil, err
 	}
 
-	go s.compactor()
 	return s, nil
 }
 
@@ -102,28 +100,6 @@ func (s *Storage) Exists(key string) bool {
 
 func (s *Storage) Count() int64 {
 	return s.cache.items.Load()
-}
-
-func (s *Storage) compactor() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		s.wal.compact()
-
-		// persist hot items to disk
-		for i := range s.cache.shards {
-			shard := s.cache.shards[i]
-			shard.mu.RLock()
-			for h, e := range shard.m {
-				if atomic.LoadUint32(&e.hits) > 10 {
-					path := filepath.Join(s.dir, fmtHex(h))
-					os.WriteFile(path, e.data, 0644)
-				}
-			}
-			shard.mu.RUnlock()
-		}
-	}
 }
 
 func (s *Storage) Close() {

@@ -4,7 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
+	"net"
 	"runtime"
 	"time"
 )
@@ -26,27 +26,23 @@ type Vault struct {
 	storage *Storage
 	cluster *Cluster
 	limiter *RateLimiter
+	edge    *EdgeCache
+	async   *AsyncReplicator
 }
 
 func main() {
-	mode := flag.String("mode", "worker", "worker or master")
 	port := flag.Int("port", 3000, "port")
 	pubURL := flag.String("public-url", "", "public url")
-	master := flag.String("master", "", "master url")
 	dataDir := flag.String("data", "/data", "data dir")
-	volumes := flag.String("volumes", "", "volume urls")
 	authKey := flag.String("auth", "", "auth key")
+	edgeMode := flag.Bool("edge", false, "edge mode")
+	asyncMode := flag.Bool("async", false, "async replication")
 	flag.Parse()
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	if *pubURL == "" {
-		*pubURL = fmt.Sprintf("http://localhost:%d", *port)
-	}
-
-	if *mode == "master" {
-		runMaster(*port, *volumes)
-		return
+		*pubURL = fmt.Sprintf("localhost:%d", *port)
 	}
 
 	storage, err := NewStorage(*dataDir)
@@ -55,24 +51,29 @@ func main() {
 	}
 	defer storage.Close()
 
+	cluster := NewCluster(*pubURL, *authKey, storage)
+
 	vault := &Vault{
 		storage: storage,
-		cluster: NewCluster(*pubURL, *master, *authKey, storage),
+		cluster: cluster,
 		limiter: NewRateLimiter(RateLimit),
 	}
 
-	if *master != "" {
-		go vault.cluster.start()
+	if *edgeMode {
+		vault.edge = NewEdgeCache([]string{}, cluster)
 	}
 
-	srv := &http.Server{
-		Addr:           fmt.Sprintf(":%d", *port),
-		Handler:        vault,
-		ReadTimeout:    ReadTimeout,
-		WriteTimeout:   WriteTimeout,
-		MaxHeaderBytes: 1 << 20,
+	if *asyncMode {
+		vault.async = NewAsyncReplicator(storage, cluster, 10)
 	}
 
-	log.Printf("starting on %s", srv.Addr)
-	log.Fatal(srv.ListenAndServe())
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	server := NewBinaryServer(vault)
+
+	log.Printf("starting on %s", ln.Addr())
+	log.Fatal(server.Serve(ln))
 }
