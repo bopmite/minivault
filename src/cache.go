@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/heap"
 	"sync"
 	"sync/atomic"
 )
@@ -37,8 +38,7 @@ func (c *cache) set(h uint64, data []byte) {
 	s.mu.Lock()
 	if old, ok := s.m[h]; ok {
 		c.size.Add(int64(len(data) - len(old.data)))
-		old.data = data
-		old.hits = 0
+		s.m[h] = &entry{data: data}
 	} else {
 		s.m[h] = &entry{data: data}
 		c.size.Add(int64(len(data)))
@@ -55,12 +55,16 @@ func (c *cache) get(h uint64) ([]byte, bool) {
 	s := c.shards[h%shards]
 	s.mu.RLock()
 	e, ok := s.m[h]
-	s.mu.RUnlock()
-	if ok {
-		atomic.AddUint32(&e.hits, 1)
-		return e.data, true
+	if !ok {
+		s.mu.RUnlock()
+		return nil, false
 	}
-	return nil, false
+	data := make([]byte, len(e.data))
+	copy(data, e.data)
+	atomic.AddUint32(&e.hits, 1)
+	s.mu.RUnlock()
+
+	return data, true
 }
 
 func (c *cache) del(h uint64) {
@@ -85,41 +89,53 @@ func (c *cache) has(h uint64) bool {
 	return ok
 }
 
+type evictItem struct {
+	h    uint64
+	hits uint32
+	size int
+}
+
+type minHeap []evictItem
+
+func (h minHeap) Len() int           { return len(h) }
+func (h minHeap) Less(i, j int) bool { return h[i].hits < h[j].hits }
+func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *minHeap) Push(x any)        { *h = append(*h, x.(evictItem)) }
+func (h *minHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
 func (c *cache) evict(max int64) {
 	if c.size.Load() < max {
 		return
 	}
 
-	type item struct {
-		h    uint64
-		hits uint32
-		size int
-	}
-
-	var all []item
-	for i := range c.shards {
-		s := c.shards[i]
-		s.mu.RLock()
-		for h, e := range s.m {
-			all = append(all, item{h, atomic.LoadUint32(&e.hits), len(e.data)})
-		}
-		s.mu.RUnlock()
-	}
-
-	// evict 25% of items with lowest hits
-	n := len(all) / 4
+	n := int(c.items.Load() / 4)
 	if n == 0 {
 		return
 	}
 
-	for i := range n {
-		min := i
-		for j := i + 1; j < len(all); j++ {
-			if all[j].hits < all[min].hits {
-				min = j
-			}
+	h := make(minHeap, 0, c.items.Load())
+	for i := range c.shards {
+		shard := c.shards[i]
+		shard.mu.RLock()
+		for hash, e := range shard.m {
+			h = append(h, evictItem{
+				h:    hash,
+				hits: atomic.LoadUint32(&e.hits),
+				size: len(e.data),
+			})
 		}
-		all[i], all[min] = all[min], all[i]
-		c.del(all[i].h)
+		shard.mu.RUnlock()
+	}
+
+	heap.Init(&h)
+	for i := 0; i < n && h.Len() > 0; i++ {
+		item := heap.Pop(&h).(evictItem)
+		c.del(item.h)
 	}
 }
