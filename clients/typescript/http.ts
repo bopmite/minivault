@@ -84,25 +84,9 @@ export class MiniVault {
   }
 
   /**
-   * Get a value and parse as JSON
+   * Get a value (automatically unwraps from JSON response)
    */
   async get<T = any>(key: string): Promise<T | null> {
-    try {
-      const data = await this.getRaw(key);
-      if (!data) return null;
-
-      const text = new TextDecoder().decode(data);
-      return JSON.parse(text) as T;
-    } catch (error) {
-      this.logError(`Failed to parse JSON for key ${key}:`, error);
-      return null;
-    }
-  }
-
-  /**
-   * Get raw binary data
-   */
-  async getRaw(key: string): Promise<Uint8Array | null> {
     try {
       const url = `${this.baseUrl}/${key}`;
       const controller = new AbortController();
@@ -125,9 +109,18 @@ export class MiniVault {
         return null;
       }
 
-      const data = new Uint8Array(await response.arrayBuffer());
-      this.log(`Cache hit: ${key} (${data.length} bytes)`);
-      return data;
+      const result = await response.json();
+
+      if (result.success && result.data !== undefined) {
+        this.log(`Cache hit: ${key}`);
+        return result.data as T;
+      }
+
+      if (!result.success) {
+        this.logError(`GET error for ${key}: ${result.error}`);
+      }
+
+      return null;
     } catch (error) {
       if ((error as Error).name === 'AbortError') {
         this.logError(`GET timeout for ${key}`);
@@ -139,25 +132,16 @@ export class MiniVault {
   }
 
   /**
-   * Set a value (automatically serializes to JSON)
+   * Set a value (automatically wraps in { value: ... })
    */
   async set(key: string, value: any): Promise<boolean> {
-    const json = JSON.stringify(value);
-    const data = new TextEncoder().encode(json);
-    return this.setRaw(key, data);
-  }
-
-  /**
-   * Set raw binary data
-   */
-  async setRaw(key: string, data: Uint8Array | ArrayBuffer): Promise<boolean> {
     try {
       const url = `${this.baseUrl}/${key}`;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), this.timeout);
 
       const headers: HeadersInit = {
-        'Content-Type': 'application/octet-stream',
+        'Content-Type': 'application/json',
       };
 
       if (this.apiKey) {
@@ -167,20 +151,26 @@ export class MiniVault {
       const response = await fetch(url, {
         method: 'PUT',
         headers,
-        body: data,
+        body: JSON.stringify({ value }),
         signal: controller.signal,
       });
 
       clearTimeout(timeoutId);
 
       if (!response.ok) {
-        const text = await response.text();
-        this.logError(`SET failed for ${key}: ${response.status} ${text}`);
+        const result = await response.json();
+        this.logError(`SET failed for ${key}: ${response.status} ${result.error || 'unknown error'}`);
         return false;
       }
 
-      this.log(`Cache set: ${key} (${data.byteLength} bytes)`);
-      return true;
+      const result = await response.json();
+      if (result.success) {
+        this.log(`Cache set: ${key}`);
+        return true;
+      }
+
+      this.logError(`SET failed for ${key}: ${result.error}`);
+      return false;
     } catch (error) {
       if ((error as Error).name === 'AbortError') {
         this.logError(`SET timeout for ${key}`);
@@ -213,13 +203,15 @@ export class MiniVault {
 
       clearTimeout(timeoutId);
 
-      if (!response.ok) {
-        this.logError(`DELETE failed for ${key}: ${response.status}`);
-        return false;
+      const result = await response.json();
+
+      if (result.success) {
+        this.log(`Cache delete: ${key}`);
+        return true;
       }
 
-      this.log(`Cache delete: ${key}`);
-      return true;
+      this.logError(`DELETE failed for ${key}: ${result.error}`);
+      return false;
     } catch (error) {
       if ((error as Error).name === 'AbortError') {
         this.logError(`DELETE timeout for ${key}`);

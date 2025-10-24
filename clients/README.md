@@ -12,14 +12,15 @@ import { MiniVault } from './typescript/http';
 
 const vault = new MiniVault('http://localhost:8080', 'your-api-key');
 
-// JSON operations
+// Store and retrieve JSON (automatic wrapping/unwrapping)
 await vault.set('user:123', { name: 'Alice', age: 30 });
-const user = await vault.get('user:123');
+const user = await vault.get<User>('user:123');
 await vault.delete('user:123');
 
-// Raw binary operations
-await vault.setRaw('image:logo', imageBuffer);
-const logo = await vault.getRaw('image:logo');
+// Store strings, numbers, arrays, objects - all work!
+await vault.set('counter', 42);
+await vault.set('message', 'hello world');
+await vault.set('items', ['a', 'b', 'c']);
 
 // Health check
 const health = await vault.health();
@@ -53,7 +54,7 @@ import "path/to/minivault"
 
 client := minivault.NewHTTPClient("http://localhost:8080", "your-api-key")
 
-// JSON operations
+// Store and retrieve any JSON-serializable data
 user := User{Name: "Alice", Age: 30}
 err := client.SetJSON("user:123", user)
 
@@ -62,9 +63,9 @@ err := client.GetJSON("user:123", &result)
 
 err := client.Delete("user:123")
 
-// Raw operations
-err := client.Set("data:raw", []byte("hello world"))
-data, err := client.Get("data:raw")
+// Store strings, numbers, maps, slices - all work!
+err := client.Set("counter", 42)
+err := client.Set("message", "hello world")
 
 // Health check
 health, err := client.Health()
@@ -100,14 +101,15 @@ from minivault_http import MiniVault
 
 vault = MiniVault('http://localhost:8080', 'your-api-key')
 
-# JSON operations
-vault.set_json('user:123', {'name': 'Alice', 'age': 30})
-user = vault.get_json('user:123')
+# Store and retrieve any JSON-serializable data
+vault.set('user:123', {'name': 'Alice', 'age': 30})
+user = vault.get('user:123')
 vault.delete('user:123')
 
-# Raw operations
-vault.set('data:raw', b'hello world')
-data = vault.get('data:raw')
+# Store strings, numbers, lists, dicts - all work!
+vault.set('counter', 42)
+vault.set('message', 'hello world')
+vault.set('items', ['a', 'b', 'c'])
 
 # Health check
 health = vault.health()
@@ -115,7 +117,7 @@ print(f"Cache: {health['cache_items']} items")
 
 # Batch operations
 results = vault.mget(['key1', 'key2', 'key3'])
-vault.mset({'key1': b'val1', 'key2': b'val2'})
+vault.mset({'key1': 'val1', 'key2': 'val2'})
 ```
 
 **Binary Client** (`python/minivault_binary.py`)
@@ -147,7 +149,7 @@ let vault = MiniVault::new(
     Some("your-api-key".to_string()),
 );
 
-// JSON operations
+// Store and retrieve JSON-serializable data
 #[derive(Serialize, Deserialize)]
 struct User {
     name: String,
@@ -160,9 +162,8 @@ vault.set_json("user:123", &user).await?;
 let result: User = vault.get_json("user:123").await?.unwrap();
 vault.delete("user:123").await?;
 
-// Raw operations
-vault.set("data:raw", b"hello world".to_vec()).await?;
-let data = vault.get("data:raw").await?;
+// Note: Rust HTTP client still uses Vec<u8> for raw data
+// (Other languages support storing any JSON-serializable type directly)
 
 // Health check
 let health = vault.health().await?;

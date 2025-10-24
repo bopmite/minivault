@@ -38,10 +38,35 @@ Enable with `-http` flag. Zero overhead - calls storage directly without binary 
 
 **Endpoints:**
 - `GET /:key` - Retrieve value
-- `PUT /:key` - Store value (body = raw data)
+- `PUT /:key` - Store value (JSON body: `{"value": <data>}`)
 - `POST /:key` - Store value (alias for PUT)
 - `DELETE /:key` - Delete value
 - `GET /health` - Cluster health check
+
+**Request/Response Format:**
+
+PUT/POST Request:
+```json
+{
+  "value": <your data>
+}
+```
+
+GET Response:
+```json
+{
+  "success": true,
+  "data": <your data>
+}
+```
+
+Error Response:
+```json
+{
+  "success": false,
+  "error": "error message"
+}
+```
 
 **Example:**
 ```bash
@@ -49,10 +74,13 @@ Enable with `-http` flag. Zero overhead - calls storage directly without binary 
 ./minivault -port 3000 -http 8080 -data ./data
 
 # Store value
-curl -X PUT http://localhost:8080/mykey -d "hello world"
+curl -X PUT http://localhost:8080/mykey \
+  -H "Content-Type: application/json" \
+  -d '{"value": "hello world"}'
 
 # Retrieve value
 curl http://localhost:8080/mykey
+# Returns: {"success":true,"data":"hello world"}
 
 # Delete value
 curl -X DELETE http://localhost:8080/mykey

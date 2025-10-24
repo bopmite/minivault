@@ -26,38 +26,66 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	key := strings.TrimPrefix(r.URL.Path, "/")
 	if key == "" {
-		http.Error(w, "key required", 400)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "key required"})
 		return
 	}
+
+	w.Header().Set("Content-Type", "application/json")
 
 	switch r.Method {
 	case http.MethodGet:
 		data, err := s.vault.storage.Get(key)
 		if err != nil {
-			http.Error(w, "not found", 404)
+			w.WriteHeader(404)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "not found"})
 			return
 		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Write(data)
+
+		var value interface{}
+		if err := json.Unmarshal(data, &value); err != nil {
+			value = string(data)
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "data": value})
 
 	case http.MethodPut, http.MethodPost:
-		data, err := io.ReadAll(r.Body)
+		var req map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "invalid json"})
+			return
+		}
+
+		value, ok := req["value"]
+		if !ok {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "missing value field"})
+			return
+		}
+
+		data, err := json.Marshal(value)
 		if err != nil {
-			http.Error(w, "read error", 400)
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "failed to marshal value"})
 			return
 		}
+
 		if err := s.vault.cluster.write(key, data); err != nil {
-			http.Error(w, "write error", 500)
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "write error"})
 			return
 		}
-		w.WriteHeader(204)
+
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 
 	case http.MethodDelete:
 		s.vault.storage.Delete(key)
-		w.WriteHeader(204)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 
 	default:
-		http.Error(w, "method not allowed", 405)
+		w.WriteHeader(405)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "method not allowed"})
 	}
 }
 

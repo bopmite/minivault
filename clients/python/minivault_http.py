@@ -12,8 +12,8 @@ class MiniVault:
         self.timeout = timeout
         self.session = requests.Session()
 
-    def get(self, key: str) -> Optional[bytes]:
-        """Get raw bytes for a key"""
+    def get(self, key: str) -> Optional[Any]:
+        """Get a value (automatically unwraps from JSON response)"""
         try:
             url = f"{self.base_url}/{key}"
             response = self.session.get(url, timeout=self.timeout)
@@ -22,42 +22,42 @@ class MiniVault:
                 return None
 
             response.raise_for_status()
-            return response.content
+            result = response.json()
+
+            if result.get('success', False):
+                return result.get('data')
+
+            return None
         except Exception as e:
             print(f"GET error for {key}: {e}")
             return None
 
     def get_json(self, key: str) -> Optional[Any]:
         """Get and deserialize JSON"""
-        data = self.get(key)
-        if data is None:
-            return None
-        try:
-            return json.loads(data.decode('utf-8'))
-        except Exception as e:
-            print(f"Failed to parse JSON for {key}: {e}")
-            return None
+        return self.get(key)
 
-    def set(self, key: str, data: bytes) -> bool:
-        """Set raw bytes for a key"""
+    def set(self, key: str, value: Any) -> bool:
+        """Set a value (automatically wraps in JSON request)"""
         try:
             url = f"{self.base_url}/{key}"
-            headers = {'Content-Type': 'application/octet-stream'}
+            headers = {'Content-Type': 'application/json'}
 
             if self.api_key:
                 headers['X-API-Key'] = self.api_key
 
-            response = self.session.put(url, data=data, headers=headers, timeout=self.timeout)
+            payload = {'value': value}
+            response = self.session.put(url, json=payload, headers=headers, timeout=self.timeout)
             response.raise_for_status()
-            return True
+
+            result = response.json()
+            return result.get('success', False)
         except Exception as e:
             print(f"SET error for {key}: {e}")
             return False
 
     def set_json(self, key: str, value: Any) -> bool:
         """Serialize and store JSON"""
-        data = json.dumps(value).encode('utf-8')
-        return self.set(key, data)
+        return self.set(key, value)
 
     def delete(self, key: str) -> bool:
         """Delete a key"""
@@ -70,7 +70,9 @@ class MiniVault:
 
             response = self.session.delete(url, headers=headers, timeout=self.timeout)
             response.raise_for_status()
-            return True
+
+            result = response.json()
+            return result.get('success', False)
         except Exception as e:
             print(f"DELETE error for {key}: {e}")
             return False
@@ -90,7 +92,7 @@ class MiniVault:
             print(f"Health check error: {e}")
             return None
 
-    def mget(self, keys: list[str]) -> Dict[str, bytes]:
+    def mget(self, keys: list[str]) -> Dict[str, Any]:
         """Parallel get multiple keys"""
         from concurrent.futures import ThreadPoolExecutor
 
@@ -105,7 +107,7 @@ class MiniVault:
 
         return results
 
-    def mset(self, entries: Dict[str, bytes]) -> bool:
+    def mset(self, entries: Dict[str, Any]) -> bool:
         """Parallel set multiple key-value pairs"""
         from concurrent.futures import ThreadPoolExecutor
 

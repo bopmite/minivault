@@ -103,8 +103,8 @@ func (c *HTTPClient) log(format string, args ...interface{}) {
 	}
 }
 
-// Get retrieves raw bytes for a key
-func (c *HTTPClient) Get(key string) ([]byte, error) {
+// Get retrieves a value for a key (automatically unwraps from JSON response)
+func (c *HTTPClient) Get(key string) (interface{}, error) {
 	url := fmt.Sprintf("%s/%s", c.baseURL, key)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
@@ -124,17 +124,25 @@ func (c *HTTPClient) Get(key string) ([]byte, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("GET failed: %d %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("GET failed: %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+	var result struct {
+		Success bool        `json:"success"`
+		Data    interface{} `json:"data"`
+		Error   string      `json:"error"`
 	}
 
-	c.log("Cache hit: %s (%d bytes)", key, len(data))
-	return data, nil
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if !result.Success {
+		return nil, fmt.Errorf("GET failed: %s", result.Error)
+	}
+
+	c.log("Cache hit: %s", key)
+	return result.Data, nil
 }
 
 // GetJSON retrieves and unmarshals JSON data
@@ -147,19 +155,30 @@ func (c *HTTPClient) GetJSON(key string, v interface{}) error {
 		return fmt.Errorf("key not found: %s", key)
 	}
 
-	return json.Unmarshal(data, v)
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal data: %w", err)
+	}
+
+	return json.Unmarshal(jsonData, v)
 }
 
-// Set stores raw bytes for a key
-func (c *HTTPClient) Set(key string, data []byte) error {
+// Set stores a value for a key (automatically wraps in JSON request)
+func (c *HTTPClient) Set(key string, value interface{}) error {
 	url := fmt.Sprintf("%s/%s", c.baseURL, key)
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPut, url, bytes.NewReader(data))
+	reqBody := map[string]interface{}{"value": value}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal value: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPut, url, bytes.NewReader(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
@@ -170,22 +189,26 @@ func (c *HTTPClient) Set(key string, data []byte) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("SET failed: %d %s", resp.StatusCode, string(body))
+	var result struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
 	}
 
-	c.log("Cache set: %s (%d bytes)", key, len(data))
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if !result.Success {
+		return fmt.Errorf("SET failed: %s", result.Error)
+	}
+
+	c.log("Cache set: %s", key)
 	return nil
 }
 
 // SetJSON marshals and stores JSON data
 func (c *HTTPClient) SetJSON(key string, v interface{}) error {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %w", err)
-	}
-	return c.Set(key, data)
+	return c.Set(key, v)
 }
 
 // Delete removes a key
@@ -207,8 +230,17 @@ func (c *HTTPClient) Delete(key string) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("DELETE failed: %d", resp.StatusCode)
+	var result struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if !result.Success {
+		return fmt.Errorf("DELETE failed: %s", result.Error)
 	}
 
 	c.log("Cache delete: %s", key)
@@ -247,10 +279,10 @@ func (c *HTTPClient) Health() (*Health, error) {
 }
 
 // MGet retrieves multiple keys in parallel
-func (c *HTTPClient) MGet(keys []string) (map[string][]byte, error) {
+func (c *HTTPClient) MGet(keys []string) (map[string]interface{}, error) {
 	type result struct {
 		key  string
-		data []byte
+		data interface{}
 		err  error
 	}
 
@@ -263,7 +295,7 @@ func (c *HTTPClient) MGet(keys []string) (map[string][]byte, error) {
 		}(key)
 	}
 
-	output := make(map[string][]byte)
+	output := make(map[string]interface{})
 	for i := 0; i < len(keys); i++ {
 		r := <-results
 		if r.err == nil && r.data != nil {
@@ -275,7 +307,7 @@ func (c *HTTPClient) MGet(keys []string) (map[string][]byte, error) {
 }
 
 // MSet stores multiple key-value pairs in parallel
-func (c *HTTPClient) MSet(entries map[string][]byte) error {
+func (c *HTTPClient) MSet(entries map[string]interface{}) error {
 	type result struct {
 		key string
 		err error
@@ -283,11 +315,11 @@ func (c *HTTPClient) MSet(entries map[string][]byte) error {
 
 	results := make(chan result, len(entries))
 
-	for key, data := range entries {
-		go func(k string, d []byte) {
-			err := c.Set(k, d)
+	for key, value := range entries {
+		go func(k string, v interface{}) {
+			err := c.Set(k, v)
 			results <- result{key: k, err: err}
-		}(key, data)
+		}(key, value)
 	}
 
 	var firstErr error
