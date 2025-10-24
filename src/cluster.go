@@ -11,12 +11,13 @@ import (
 )
 
 type Cluster struct {
-	self    string
-	nodes   sync.Map
-	client  *BinaryClient
-	workers chan struct{}
-	authKey string
-	storage *Storage
+	self           string
+	nodes          sync.Map
+	client         *BinaryClient
+	workers        chan struct{}
+	authKey        string
+	storage        *Storage
+	workerPoolSize int
 }
 
 type node struct {
@@ -24,16 +25,17 @@ type node struct {
 	seen time.Time
 }
 
-func NewCluster(self, authKey string, storage *Storage) *Cluster {
+func NewCluster(self, authKey string, storage *Storage, workerPoolSize int) *Cluster {
 	c := &Cluster{
-		self:    self,
-		authKey: authKey,
-		storage: storage,
-		workers: make(chan struct{}, WorkerPool),
-		client:  NewBinaryClient(),
+		self:           self,
+		authKey:        authKey,
+		storage:        storage,
+		workerPoolSize: workerPoolSize,
+		workers:        make(chan struct{}, workerPoolSize),
+		client:         NewBinaryClient(),
 	}
 
-	for range WorkerPool {
+	for range workerPoolSize {
 		c.workers <- struct{}{}
 	}
 
@@ -105,28 +107,38 @@ func (c *Cluster) write(key string, data []byte) error {
 	results := make(chan error, len(nodes))
 	timeout := time.After(WriteTimeout)
 
+	acquired := 0
 	for _, n := range nodes {
-		<-c.workers
-		go func(node string) {
-			defer func() { c.workers <- struct{}{} }()
-
-			var err error
-			if node == c.self {
-				err = c.storage.Set(key, data)
-			} else {
-				err = c.client.Sync(node, key, data)
-			}
-			results <- err
-		}(n)
+		select {
+		case <-c.workers:
+			acquired++
+			go func(node string) {
+				defer func() { c.workers <- struct{}{} }()
+				var err error
+				if node == c.self {
+					err = c.storage.Set(key, data)
+				} else {
+					err = c.client.Sync(node, key, data)
+				}
+				results <- err
+			}(n)
+		case <-time.After(50 * time.Millisecond):
+			results <- fmt.Errorf("worker timeout")
+		}
 	}
 
 	ok := 0
-	for range nodes {
+	for i := 0; i < acquired; i++ {
 		select {
 		case err := <-results:
 			if err == nil {
 				ok++
 				if ok >= quorum {
+					go func() {
+						for j := i + 1; j < acquired; j++ {
+							<-results
+						}
+					}()
 					return nil
 				}
 			}

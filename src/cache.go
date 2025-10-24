@@ -38,8 +38,7 @@ func (c *cache) set(h uint64, data []byte) {
 	s.mu.Lock()
 	if old, ok := s.m[h]; ok {
 		c.size.Add(int64(len(data) - len(old.data)))
-		old.data = data
-		old.hits = 0
+		s.m[h] = &entry{data: data}
 	} else {
 		s.m[h] = &entry{data: data}
 		c.size.Add(int64(len(data)))
@@ -56,12 +55,16 @@ func (c *cache) get(h uint64) ([]byte, bool) {
 	s := c.shards[h%shards]
 	s.mu.RLock()
 	e, ok := s.m[h]
-	s.mu.RUnlock()
-	if ok {
-		atomic.AddUint32(&e.hits, 1)
-		return e.data, true
+	if !ok {
+		s.mu.RUnlock()
+		return nil, false
 	}
-	return nil, false
+	data := make([]byte, len(e.data))
+	copy(data, e.data)
+	atomic.AddUint32(&e.hits, 1)
+	s.mu.RUnlock()
+
+	return data, true
 }
 
 func (c *cache) del(h uint64) {

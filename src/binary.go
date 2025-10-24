@@ -2,27 +2,64 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"golang.org/x/time/rate"
 )
+
+var hdrPool = sync.Pool{New: func() interface{} { return make([]byte, 5) }}
 
 const (
 	OpGet    = 0x01
 	OpSet    = 0x02
 	OpDelete = 0x03
 	OpSync   = 0x04
+	OpHealth = 0x05
+	OpAuth   = 0x06
 )
 
-type BinaryServer struct {
-	vault *Vault
+func writeErr(conn net.Conn) error {
+	_, err := conn.Write([]byte{0xFF, 0, 0, 0, 0})
+	return err
 }
 
-func NewBinaryServer(vault *Vault) *BinaryServer {
-	return &BinaryServer{vault: vault}
+type BinaryServer struct {
+	vault      *Vault
+	authKey    string
+	authMode   AuthMode
+	rateLimit  int
+	startTime  time.Time
+	connSem    chan struct{}
+	maxConn    int
+	limiter    *rate.Limiter
+}
+
+func NewBinaryServer(vault *Vault, authKey string, authMode AuthMode, rateLimit int, startTime time.Time) *BinaryServer {
+	maxConn := 50000
+	sem := make(chan struct{}, maxConn)
+	for i := 0; i < maxConn; i++ {
+		sem <- struct{}{}
+	}
+	var limiter *rate.Limiter
+	if rateLimit > 0 {
+		limiter = rate.NewLimiter(rate.Limit(rateLimit), rateLimit/10)
+	}
+	return &BinaryServer{
+		vault:     vault,
+		authKey:   authKey,
+		authMode:  authMode,
+		rateLimit: rateLimit,
+		startTime: startTime,
+		connSem:   sem,
+		maxConn:   maxConn,
+		limiter:   limiter,
+	}
 }
 
 func (s *BinaryServer) Serve(ln net.Listener) error {
@@ -38,18 +75,34 @@ func (s *BinaryServer) Serve(ln net.Listener) error {
 			tcp.SetWriteBuffer(512 * 1024)
 		}
 
-		go s.handle(conn)
+		select {
+		case <-s.connSem:
+			go func() {
+				defer func() { s.connSem <- struct{}{} }()
+				s.handle(conn)
+			}()
+		default:
+			conn.Close()
+		}
 	}
 }
 
 func (s *BinaryServer) handle(conn net.Conn) {
 	defer conn.Close()
 
+	authenticated := s.authMode == AuthNone
 	hdr := make([]byte, 7)
 	keyBuf := make([]byte, 0, 1024)
 	valBuf := make([]byte, 0, 16384)
 
 	for {
+		if s.limiter != nil && !s.limiter.Allow() {
+			if writeErr(conn) != nil {
+				return
+			}
+			continue
+		}
+
 		if _, err := io.ReadFull(conn, hdr[:3]); err != nil {
 			return
 		}
@@ -65,19 +118,56 @@ func (s *BinaryServer) handle(conn net.Conn) {
 			return
 		}
 
+		needsAuth := false
+		if s.authMode == AuthAll && op != OpHealth && op != OpAuth {
+			needsAuth = true
+		} else if s.authMode == AuthWrites && (op == OpSet || op == OpDelete || op == OpSync) {
+			needsAuth = true
+		}
+
+		if needsAuth && !authenticated {
+			if writeErr(conn) != nil {
+				return
+			}
+			if op == OpSet || op == OpDelete || op == OpSync {
+				return
+			}
+			continue
+		}
+
 		switch op {
+		case OpAuth:
+			if string(keyBuf) == s.authKey && s.authKey != "" {
+				authenticated = true
+				if _, err := conn.Write([]byte{0x00, 0, 0, 0, 0}); err != nil {
+					return
+				}
+			} else {
+				if writeErr(conn) != nil {
+					return
+				}
+			}
+
 		case OpGet:
 			data, err := s.vault.storage.Get(string(keyBuf))
 			if err != nil {
-				conn.Write([]byte{0xFF, 0, 0, 0, 0})
+				if writeErr(conn) != nil {
+					return
+				}
 				continue
 			}
 
-			respHdr := make([]byte, 5)
+			respHdr := hdrPool.Get().([]byte)
 			respHdr[0] = 0x00
 			binary.LittleEndian.PutUint32(respHdr[1:], uint32(len(data)))
-			conn.Write(respHdr)
-			conn.Write(data)
+			if _, err := conn.Write(respHdr); err != nil {
+				hdrPool.Put(respHdr)
+				return
+			}
+			hdrPool.Put(respHdr)
+			if _, err := conn.Write(data); err != nil {
+				return
+			}
 
 		case OpSet:
 			if _, err := io.ReadFull(conn, hdr[:5]); err != nil {
@@ -96,14 +186,20 @@ func (s *BinaryServer) handle(conn net.Conn) {
 
 			data, err := decompress(valBuf, compressed)
 			if err != nil {
-				conn.Write([]byte{0xFF, 0, 0, 0, 0})
+				if writeErr(conn) != nil {
+					return
+				}
 				continue
 			}
 
 			if err := s.vault.cluster.write(string(keyBuf), data); err != nil {
-				conn.Write([]byte{0xFF, 0, 0, 0, 0})
+				if writeErr(conn) != nil {
+					return
+				}
 			} else {
-				conn.Write([]byte{0x00, 0, 0, 0, 0})
+				if _, err := conn.Write([]byte{0x00, 0, 0, 0, 0}); err != nil {
+					return
+				}
 			}
 
 		case OpDelete:
@@ -114,7 +210,9 @@ func (s *BinaryServer) handle(conn net.Conn) {
 					go s.vault.cluster.sendDelete(node, string(keyBuf))
 				}
 			}
-			conn.Write([]byte{0x00, 0, 0, 0, 0})
+			if _, err := conn.Write([]byte{0x00, 0, 0, 0, 0}); err != nil {
+				return
+			}
 
 		case OpSync:
 			if _, err := io.ReadFull(conn, hdr[:5]); err != nil {
@@ -133,14 +231,48 @@ func (s *BinaryServer) handle(conn net.Conn) {
 
 			data, err := decompress(valBuf, compressed)
 			if err != nil {
-				conn.Write([]byte{0xFF, 0, 0, 0, 0})
+				if writeErr(conn) != nil {
+					return
+				}
 				continue
 			}
 
 			if err := s.vault.storage.Set(string(keyBuf), data); err != nil {
-				conn.Write([]byte{0xFF, 0, 0, 0, 0})
+				if writeErr(conn) != nil {
+					return
+				}
 			} else {
-				conn.Write([]byte{0x00, 0, 0, 0, 0})
+				if _, err := conn.Write([]byte{0x00, 0, 0, 0, 0}); err != nil {
+					return
+				}
+			}
+
+		case OpHealth:
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+
+			health := map[string]interface{}{
+				"status":          "healthy",
+				"uptime_seconds":  int64(time.Since(s.startTime).Seconds()),
+				"cache_items":     s.vault.storage.cache.items.Load(),
+				"cache_size_mb":   s.vault.storage.cache.size.Load() / (1024 * 1024),
+				"storage_size_mb": s.vault.storage.size.Load() / (1024 * 1024),
+				"goroutines":      runtime.NumGoroutine(),
+				"memory_mb":       m.Alloc / (1024 * 1024),
+			}
+
+			jsonData, _ := json.Marshal(health)
+
+			respHdr := hdrPool.Get().([]byte)
+			respHdr[0] = 0x00
+			binary.LittleEndian.PutUint32(respHdr[1:], uint32(len(jsonData)))
+			if _, err := conn.Write(respHdr); err != nil {
+				hdrPool.Put(respHdr)
+				return
+			}
+			hdrPool.Put(respHdr)
+			if _, err := conn.Write(jsonData); err != nil {
+				return
 			}
 		}
 	}
@@ -317,46 +449,4 @@ func (c *BinaryClient) Delete(addr, key string) error {
 
 	pool.Put(conn)
 	return nil
-}
-
-type RateLimiter struct {
-	tokens   atomic.Uint64
-	rate     uint64
-	capacity uint64
-	last     atomic.Int64
-}
-
-func NewRateLimiter(rate int) *RateLimiter {
-	rl := &RateLimiter{
-		rate:     uint64(rate),
-		capacity: uint64(rate),
-	}
-	rl.tokens.Store(uint64(rate))
-	rl.last.Store(time.Now().UnixNano())
-	return rl
-}
-
-func (rl *RateLimiter) Allow() bool {
-	now := time.Now().UnixNano()
-	last := rl.last.Swap(now)
-	elapsed := float64(now-last) / 1e9
-
-	refill := uint64(elapsed * float64(rl.rate))
-
-	for {
-		tokens := rl.tokens.Load()
-		newTokens := tokens + refill
-		if newTokens > rl.capacity {
-			newTokens = rl.capacity
-		}
-
-		if newTokens < 1 {
-			rl.tokens.Store(newTokens)
-			return false
-		}
-
-		if rl.tokens.CompareAndSwap(tokens, newTokens-1) {
-			return true
-		}
-	}
 }

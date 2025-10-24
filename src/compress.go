@@ -33,13 +33,11 @@ func compress(data []byte) []byte {
 	defer encoderPool.Put(enc)
 
 	enc.Reset(nil)
-	compressed := enc.EncodeAll(data, getbuf(len(data))[:0])
+	compressed := enc.EncodeAll(data, nil)
 
 	if len(compressed) >= len(data) {
-		putbuf(compressed)
 		return data
 	}
-
 	return compressed
 }
 

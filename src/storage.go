@@ -8,10 +8,11 @@ import (
 )
 
 type Storage struct {
-	dir   string
-	cache *cache
-	wal   *wal
-	size  atomic.Int64
+	dir     string
+	cache   *cache
+	wal     *wal
+	size    atomic.Int64
+	maxSize int64
 }
 
 func NewStorage(dir string) (*Storage, error) {
@@ -25,16 +26,40 @@ func NewStorage(dir string) (*Storage, error) {
 	}
 
 	s := &Storage{
-		dir:   dir,
-		cache: newCache(100000),
-		wal:   w,
+		dir:     dir,
+		cache:   newCache(100000),
+		wal:     w,
+		maxSize: MaxCacheSize,
+	}
+
+	if err := s.replayWAL(); err != nil {
+		return nil, err
 	}
 
 	if err := s.load(); err != nil {
 		return nil, err
 	}
 
+	if err := w.truncate(); err != nil {
+		return nil, err
+	}
+
 	return s, nil
+}
+
+func (s *Storage) replayWAL() error {
+	return s.wal.replay(func(h uint64, data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		path := s.getPath(h)
+		if err := os.WriteFile(path, data, 0644); err != nil {
+			return err
+		}
+		s.cache.set(h, data)
+		s.size.Add(int64(len(data)))
+		return nil
+	})
 }
 
 func (s *Storage) load() error {
@@ -52,18 +77,42 @@ func (s *Storage) load() error {
 	})
 }
 
+func (s *Storage) getPath(h uint64) string {
+	hex := fmtHex(h)
+	subdir := filepath.Join(s.dir, hex[:2])
+	os.MkdirAll(subdir, 0755)
+	return filepath.Join(subdir, hex)
+}
+
 func (s *Storage) Set(key string, value []byte) error {
 	if len(value) > MaxValueSize {
 		return fmt.Errorf("too large")
 	}
 
 	h := hash64str(key)
+	oldSize := int64(0)
+	if old, ok := s.cache.get(h); ok {
+		oldSize = int64(len(old))
+	} else {
+		path := s.getPath(h)
+		if info, err := os.Stat(path); err == nil {
+			oldSize = info.Size()
+		}
+	}
+
 	s.wal.append(h, value)
 	s.cache.set(h, value)
-	s.size.Add(int64(len(value)))
+	delta := int64(len(value)) - oldSize
+	s.size.Add(delta)
 
-	if s.size.Load() > MaxCacheSize {
-		s.cache.evict(MaxCacheSize)
+	path := s.getPath(h)
+	if err := os.WriteFile(path, value, 0644); err != nil {
+		s.size.Add(-delta)
+		return err
+	}
+
+	if s.size.Load() > s.maxSize {
+		s.cache.evict(s.maxSize)
 	}
 
 	return nil
@@ -76,7 +125,7 @@ func (s *Storage) Get(key string) ([]byte, error) {
 		return data, nil
 	}
 
-	path := filepath.Join(s.dir, fmtHex(h))
+	path := s.getPath(h)
 	data, err := os.ReadFile(path)
 	if err == nil {
 		s.cache.set(h, data)
@@ -88,8 +137,24 @@ func (s *Storage) Get(key string) ([]byte, error) {
 
 func (s *Storage) Delete(key string) error {
 	h := hash64str(key)
+
+	size := int64(0)
+	if data, ok := s.cache.get(h); ok {
+		size = int64(len(data))
+	} else {
+		path := s.getPath(h)
+		if info, err := os.Stat(path); err == nil {
+			size = info.Size()
+		}
+	}
+
+	if size > 0 {
+		s.size.Add(-size)
+	}
+
+	s.wal.append(h, nil)
 	s.cache.del(h)
-	os.Remove(filepath.Join(s.dir, fmtHex(h)))
+	os.Remove(s.getPath(h))
 	return nil
 }
 

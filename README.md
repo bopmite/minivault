@@ -6,13 +6,19 @@ Recreation of George Hotz's [minikeyvalue](https://github.com/geohot/minikeyvalu
 
 ## API
 
-Binary protocol over TCP for maximum performance.
+MiniVault supports two protocols for maximum flexibility:
+
+### Binary Protocol (TCP)
+
+High-performance binary protocol over TCP for native clients.
 
 **Operations:**
 - `0x01` - Get value
 - `0x02` - Set value
 - `0x03` - Delete value
 - `0x04` - Sync (internal replication)
+- `0x05` - Health check
+- `0x06` - Auth
 
 **Request format:**
 ```
@@ -22,6 +28,37 @@ Binary protocol over TCP for maximum performance.
 **Response format:**
 ```
 [1 byte status (0x00=success, 0xFF=error)][4 bytes value length][M bytes value]
+```
+
+### HTTP Protocol (Optional)
+
+Optional thin HTTP layer for universal client access (browsers, JavaScript, curl).
+
+Enable with `-http` flag. Zero overhead - calls storage directly without binary protocol translation.
+
+**Endpoints:**
+- `GET /:key` - Retrieve value
+- `PUT /:key` - Store value (body = raw data)
+- `POST /:key` - Store value (alias for PUT)
+- `DELETE /:key` - Delete value
+- `GET /health` - Cluster health check
+
+**Example:**
+```bash
+# Start with HTTP on port 8080
+./minivault -port 3000 -http 8080 -data ./data
+
+# Store value
+curl -X PUT http://localhost:8080/mykey -d "hello world"
+
+# Retrieve value
+curl http://localhost:8080/mykey
+
+# Delete value
+curl -X DELETE http://localhost:8080/mykey
+
+# Health check
+curl http://localhost:8080/health
 ```
 
 ## Architecture
@@ -78,27 +115,31 @@ CLUSTER_NODES="eu.example.com:3000,us.example.com:3000,asia.example.com:3000" \
 
 ## Usage
 
-Use the BinaryClient for Go applications:
+See [clients/](./clients/) directory for client implementations:
 
+- **Go**: `go/http.go`, `go/binary.go`
+- **TypeScript**: `typescript/http.ts`, `typescript/binary.ts`
+- **Python**: `python/minivault_http.py`, `python/minivault_binary.py`
+- **Rust**: `rust/http.rs`, `rust/binary.rs`
+
+**Quick Example (HTTP - TypeScript):**
+```typescript
+const cache = new MiniVaultCache('http://localhost:8080', 'your-api-key');
+
+await cache.set('user:123', { name: 'Alice', age: 30 });
+const user = await cache.get('user:123');
+await cache.delete('user:123');
+
+const health = await cache.health();
+```
+
+**Quick Example (Binary - Go):**
 ```go
 client := NewBinaryClient()
 
-// Set value
 err := client.Set("localhost:3000", "mykey", []byte("hello world"))
-
-// Get value
 data, err := client.Get("localhost:3000", "mykey")
-
-// Delete value
 err := client.Delete("localhost:3000", "mykey")
-```
-
-For other languages, implement the binary protocol or use netcat for testing:
-
-```bash
-# Raw binary protocol (hex for demonstration)
-# Set: [02][key_len][key][val_len][compressed][value]
-# Get: [01][key_len][key]
 ```
 
 ## Docker
@@ -122,12 +163,15 @@ go build -o minivault src/*.go
 
 ## Flags
 
-- `-port` - Port to listen on (default: 3000)
+- `-port` - Binary protocol port (default: 3000)
+- `-http` - HTTP port (default: 0, disabled)
 - `-public-url` - Public URL/address for this node (default: localhost:port)
 - `-data` - Data directory (default: /data)
 - `-auth` - Authentication key (optional)
-- `-edge` - Enable edge caching mode
-- `-async` - Enable async replication
+- `-authmode` - Authentication mode: none, writes, all (default: none)
+- `-ratelimit` - Rate limit in ops/sec (default: 0, unlimited)
+- `-cache` - Cache size in MB (default: 512)
+- `-workers` - Worker pool size (default: 50)
 
 **Environment Variables:**
 - `CLUSTER_NODES` - Comma-separated list of all cluster nodes (e.g., "node1:3000,node2:3000,node3:3000")
@@ -140,7 +184,7 @@ go build -o minivault src/*.go
 - OS: Linux 6.6.87 (WSL2)
 - Go: 1.25.2
 
-**Storage Layer (Optimized with xxHash + Heap Eviction + Cache Line Padding):**
+**Storage Layer:**
 - Set 1KB: 570ns/op (1.8 GB/s, **1.75M ops/sec**)
 - Set 10KB: 543ns/op (18.8 GB/s, **1.84M ops/sec**)
 - Set 100KB: 495ns/op (207 GB/s, **2.02M ops/sec**)
