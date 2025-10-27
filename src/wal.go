@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -55,7 +56,10 @@ func newWAL(dir string) (*wal, error) {
 }
 
 func (w *wal) append(h uint64, data []byte) {
-	w.ch <- walEntry{hash: h, data: data}
+	select {
+	case w.ch <- walEntry{hash: h, data: data}:
+	default:
+	}
 }
 
 func (w *wal) flusher() {
@@ -106,7 +110,7 @@ func (w *wal) flushLocked() {
 		binary.LittleEndian.PutUint16(buf[0:2], walMagic)
 		binary.LittleEndian.PutUint64(buf[2:10], hash)
 		binary.LittleEndian.PutUint32(buf[10:14], uint32(len(data)))
-		binary.LittleEndian.PutUint16(buf[14:16], uint16(hash64(data)&0xFFFF))
+		binary.LittleEndian.PutUint16(buf[14:16], uint16(crc32.ChecksumIEEE(data)&0xFFFF))
 
 		w.file.Write(buf[:])
 		w.file.Write(data)
@@ -131,13 +135,11 @@ func (w *wal) compact() {
 		return nil
 	})
 
-	w.file.Close()
-	path := filepath.Join(w.dir, "wal.log")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	tmpPath := filepath.Join(w.dir, "wal.log.tmp")
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return
 	}
-	w.file = f
 
 	var buf [16]byte
 	for hash, data := range entries {
@@ -145,13 +147,38 @@ func (w *wal) compact() {
 			binary.LittleEndian.PutUint16(buf[0:2], walMagic)
 			binary.LittleEndian.PutUint64(buf[2:10], hash)
 			binary.LittleEndian.PutUint32(buf[10:14], uint32(len(data)))
-			binary.LittleEndian.PutUint16(buf[14:16], uint16(hash64(data)&0xFFFF))
+			binary.LittleEndian.PutUint16(buf[14:16], uint16(crc32.ChecksumIEEE(data)&0xFFFF))
 
-			w.file.Write(buf[:])
-			w.file.Write(data)
+			if _, err := f.Write(buf[:]); err != nil {
+				f.Close()
+				os.Remove(tmpPath)
+				return
+			}
+			if _, err := f.Write(data); err != nil {
+				f.Close()
+				os.Remove(tmpPath)
+				return
+			}
 		}
 	}
-	w.file.Sync()
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return
+	}
+	f.Close()
+
+	w.file.Close()
+	path := filepath.Join(w.dir, "wal.log")
+	if err := os.Rename(tmpPath, path); err != nil {
+		return
+	}
+
+	newFile, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return
+	}
+	w.file = newFile
 }
 
 func (w *wal) close() {
@@ -185,10 +212,15 @@ func (w *wal) replay(fn func(h uint64, data []byte) error) error {
 
 		hash := binary.LittleEndian.Uint64(buf[2:10])
 		dataLen := binary.LittleEndian.Uint32(buf[10:14])
+		checksum := binary.LittleEndian.Uint16(buf[14:16])
 
 		data := make([]byte, dataLen)
 		if _, err := io.ReadFull(f, data); err != nil {
 			return err
+		}
+
+		if uint16(crc32.ChecksumIEEE(data)&0xFFFF) != checksum {
+			break
 		}
 
 		if err := fn(hash, data); err != nil {

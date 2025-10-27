@@ -1,5 +1,5 @@
-# Binary
-minivault
+# Test binaries
+src.test
 
 # Data directories
 data/
@@ -8,13 +8,20 @@ data/
 
 # Go
 *.exe
-*.exe~  
+*.exe~
 *.dll
 *.so
 *.dylib
 *.test
 *.out
 go.work
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
 
 # IDE
 .vscode/

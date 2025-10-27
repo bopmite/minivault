@@ -1,4 +1,5 @@
 #!/bin/bash
 set -e
 
-go test -bench=. -benchmem ../tests/...
+cd "$(dirname "$0")/.."
+go test -bench=. -benchmem -benchtime=2s ./tests/...

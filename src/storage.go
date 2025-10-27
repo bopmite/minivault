@@ -48,18 +48,28 @@ func NewStorage(dir string) (*Storage, error) {
 }
 
 func (s *Storage) replayWAL() error {
-	return s.wal.replay(func(h uint64, data []byte) error {
-		if len(data) == 0 {
-			return nil
-		}
-		path := s.getPath(h)
-		if err := os.WriteFile(path, data, 0644); err != nil {
-			return err
-		}
-		s.cache.set(h, data)
-		s.size.Add(int64(len(data)))
+	entries := make(map[uint64][]byte)
+	if err := s.wal.replay(func(h uint64, data []byte) error {
+		entries[h] = data
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	for h, data := range entries {
+		if len(data) == 0 {
+			path := s.getPath(h)
+			os.Remove(path)
+		} else {
+			path := s.getPath(h)
+			if err := os.WriteFile(path, data, 0644); err != nil {
+				return err
+			}
+			s.cache.set(h, data)
+		}
+	}
+	s.size.Store(s.cache.size.Load())
+	return nil
 }
 
 func (s *Storage) load() error {
@@ -68,10 +78,15 @@ func (s *Storage) load() error {
 			return nil
 		}
 
+		if s.size.Load() >= s.maxSize {
+			return nil
+		}
+
 		h := parseHex(filepath.Base(path))
-		if data, err := os.ReadFile(path); err == nil {
-			s.cache.set(h, data)
-			s.size.Add(info.Size())
+		if !s.cache.has(h) {
+			if data, err := os.ReadFile(path); err == nil {
+				s.cache.set(h, data)
+			}
 		}
 		return nil
 	})
@@ -90,29 +105,18 @@ func (s *Storage) Set(key string, value []byte) error {
 	}
 
 	h := hash64str(key)
-	oldSize := int64(0)
-	if old, ok := s.cache.get(h); ok {
-		oldSize = int64(len(old))
-	} else {
-		path := s.getPath(h)
-		if info, err := os.Stat(path); err == nil {
-			oldSize = info.Size()
-		}
-	}
-
 	s.wal.append(h, value)
 	s.cache.set(h, value)
-	delta := int64(len(value)) - oldSize
-	s.size.Add(delta)
+	s.size.Store(s.cache.size.Load())
 
 	path := s.getPath(h)
 	if err := os.WriteFile(path, value, 0644); err != nil {
-		s.size.Add(-delta)
 		return err
 	}
 
 	if s.size.Load() > s.maxSize {
-		s.cache.evict(s.maxSize)
+		freed := s.cache.evict(s.maxSize)
+		s.size.Add(-freed)
 	}
 
 	return nil
@@ -138,33 +142,11 @@ func (s *Storage) Get(key string) ([]byte, error) {
 func (s *Storage) Delete(key string) error {
 	h := hash64str(key)
 
-	size := int64(0)
-	if data, ok := s.cache.get(h); ok {
-		size = int64(len(data))
-	} else {
-		path := s.getPath(h)
-		if info, err := os.Stat(path); err == nil {
-			size = info.Size()
-		}
-	}
-
-	if size > 0 {
-		s.size.Add(-size)
-	}
-
 	s.wal.append(h, nil)
-	s.cache.del(h)
+	freed := s.cache.del(h)
+	s.size.Add(-freed)
 	os.Remove(s.getPath(h))
 	return nil
-}
-
-func (s *Storage) Exists(key string) bool {
-	h := hash64str(key)
-	return s.cache.has(h)
-}
-
-func (s *Storage) Count() int64 {
-	return s.cache.items.Load()
 }
 
 func (s *Storage) Close() {

@@ -5,7 +5,9 @@ services:
     build: .
     ports:
       - "3001:3000"
-    command: ["-port", "3000", "-data", "/app/data", "-volumes", "http://vault2:3000,http://vault3:3000"]
+    environment:
+      - CLUSTER_NODES=vault2:3000,vault3:3000
+    command: ["-port", "3000", "-data", "/app/data", "-public-url", "vault1:3000"]
     volumes:
       - vault1_data:/app/data
     networks:
@@ -15,7 +17,9 @@ services:
     build: .
     ports:
       - "3002:3000"
-    command: ["-port", "3000", "-data", "/app/data", "-volumes", "http://vault1:3000,http://vault3:3000"]
+    environment:
+      - CLUSTER_NODES=vault1:3000,vault3:3000
+    command: ["-port", "3000", "-data", "/app/data", "-public-url", "vault2:3000"]
     volumes:
       - vault2_data:/app/data
     networks:
@@ -25,7 +29,9 @@ services:
     build: .
     ports:
       - "3003:3000"
-    command: ["-port", "3000", "-data", "/app/data", "-volumes", "http://vault1:3000,http://vault2:3000"]
+    environment:
+      - CLUSTER_NODES=vault1:3000,vault2:3000
+    command: ["-port", "3000", "-data", "/app/data", "-public-url", "vault3:3000"]
     volumes:
       - vault3_data:/app/data
     networks:

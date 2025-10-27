@@ -2,23 +2,54 @@ package main
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"runtime"
 	"strings"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 type HTTPServer struct {
-	vault     *Vault
-	startTime time.Time
+	vault      *Vault
+	startTime  time.Time
+	authKey    string
+	authMode   AuthMode
+	limiter    *rate.Limiter
 }
 
-func NewHTTPServer(vault *Vault, startTime time.Time) *HTTPServer {
-	return &HTTPServer{vault: vault, startTime: startTime}
+func NewHTTPServer(vault *Vault, authKey string, authMode AuthMode, rateLimit int, startTime time.Time) *HTTPServer {
+	var limiter *rate.Limiter
+	if rateLimit > 0 {
+		limiter = rate.NewLimiter(rate.Limit(rateLimit), rateLimit/10)
+	}
+	return &HTTPServer{
+		vault:     vault,
+		startTime: startTime,
+		authKey:   authKey,
+		authMode:  authMode,
+		limiter:   limiter,
+	}
+}
+
+func (s *HTTPServer) checkAuth(r *http.Request, needsAuth bool) bool {
+	if !needsAuth {
+		return true
+	}
+	if s.authKey == "" {
+		return true
+	}
+	return r.Header.Get("Authorization") == "Bearer "+s.authKey
 }
 
 func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.limiter != nil && !s.limiter.Allow() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(429)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "rate limit"})
+		return
+	}
+
 	if r.URL.Path == "/health" {
 		s.handleHealth(w, r)
 		return
@@ -28,6 +59,20 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if key == "" {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "key required"})
+		return
+	}
+
+	needsAuth := false
+	if s.authMode == AuthAll {
+		needsAuth = true
+	} else if s.authMode == AuthWrites && (r.Method == http.MethodPut || r.Method == http.MethodPost || r.Method == http.MethodDelete) {
+		needsAuth = true
+	}
+
+	if !s.checkAuth(r, needsAuth) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(401)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "unauthorized"})
 		return
 	}
 
@@ -80,7 +125,11 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 
 	case http.MethodDelete:
-		s.vault.storage.Delete(key)
+		if err := s.vault.cluster.delete(key); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "delete error"})
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 
 	default:

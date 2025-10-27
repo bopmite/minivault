@@ -6,7 +6,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"runtime"
+	"syscall"
 	"time"
 )
 
@@ -71,7 +74,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer storage.Close()
 
 	storage.maxSize = MaxCacheSizeRuntime
 
@@ -91,7 +93,7 @@ func main() {
 	server := NewBinaryServer(vault, *authKey, mode, *rateLimit, startTime)
 
 	if *httpPort > 0 {
-		httpServer := NewHTTPServer(vault, startTime)
+		httpServer := NewHTTPServer(vault, *authKey, mode, *rateLimit, startTime)
 		go func() {
 			log.Printf("http server on :%d", *httpPort)
 			if err := http.ListenAndServe(fmt.Sprintf(":%d", *httpPort), httpServer); err != nil {
@@ -100,7 +102,20 @@ func main() {
 		}()
 	}
 
-	log.Printf("starting on %s (auth=%s, ratelimit=%d, cache=%dMB, workers=%d)",
-		ln.Addr(), *authMode, *rateLimit, *cacheSize, *workers)
-	log.Fatal(server.Serve(ln))
+	go func() {
+		log.Printf("starting on %s (auth=%s, ratelimit=%d, cache=%dMB, workers=%d)",
+			ln.Addr(), *authMode, *rateLimit, *cacheSize, *workers)
+		if err := server.Serve(ln); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+
+	log.Println("shutting down...")
+	ln.Close()
+	storage.Close()
+	time.Sleep(100 * time.Millisecond)
 }

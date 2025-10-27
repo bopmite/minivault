@@ -38,7 +38,8 @@ func (c *cache) set(h uint64, data []byte) {
 	s.mu.Lock()
 	if old, ok := s.m[h]; ok {
 		c.size.Add(int64(len(data) - len(old.data)))
-		s.m[h] = &entry{data: data}
+		old.data = data
+		s.m[h] = old
 	} else {
 		s.m[h] = &entry{data: data}
 		c.size.Add(int64(len(data)))
@@ -67,15 +68,18 @@ func (c *cache) get(h uint64) ([]byte, bool) {
 	return data, true
 }
 
-func (c *cache) del(h uint64) {
+func (c *cache) del(h uint64) int64 {
 	s := c.shards[h%shards]
 	s.mu.Lock()
+	size := int64(0)
 	if e, ok := s.m[h]; ok {
-		c.size.Add(-int64(len(e.data)))
+		size = int64(len(e.data))
+		c.size.Add(-size)
 		c.items.Add(-1)
 		delete(s.m, h)
 	}
 	s.mu.Unlock()
+	return size
 }
 
 func (c *cache) has(h uint64) bool {
@@ -109,33 +113,39 @@ func (h *minHeap) Pop() any {
 	return x
 }
 
-func (c *cache) evict(max int64) {
+func (c *cache) evict(max int64) int64 {
 	if c.size.Load() < max {
-		return
+		return 0
 	}
 
 	n := int(c.items.Load() / 4)
 	if n == 0 {
-		return
+		n = 1
 	}
 
-	h := make(minHeap, 0, c.items.Load())
+	h := make(minHeap, 0, n*2)
 	for i := range c.shards {
 		shard := c.shards[i]
 		shard.mu.RLock()
 		for hash, e := range shard.m {
-			h = append(h, evictItem{
-				h:    hash,
-				hits: atomic.LoadUint32(&e.hits),
-				size: len(e.data),
-			})
+			if len(h) < n*2 {
+				heap.Push(&h, evictItem{
+					h:    hash,
+					hits: atomic.LoadUint32(&e.hits),
+					size: len(e.data),
+				})
+			} else if atomic.LoadUint32(&e.hits) < h[0].hits {
+				h[0] = evictItem{h: hash, hits: atomic.LoadUint32(&e.hits), size: len(e.data)}
+				heap.Fix(&h, 0)
+			}
 		}
 		shard.mu.RUnlock()
 	}
 
-	heap.Init(&h)
+	freed := int64(0)
 	for i := 0; i < n && h.Len() > 0; i++ {
 		item := heap.Pop(&h).(evictItem)
-		c.del(item.h)
+		freed += c.del(item.h)
 	}
+	return freed
 }

@@ -1,4 +1,5 @@
 #!/bin/bash
 set -e
 
-go test -v ../tests/...
+cd "$(dirname "$0")/.."
+go test -v ./tests/...

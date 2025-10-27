@@ -66,6 +66,9 @@ func (s *BinaryServer) Serve(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if ne, ok := err.(net.Error); ok && !ne.Temporary() {
+				return err
+			}
 			continue
 		}
 
@@ -88,6 +91,10 @@ func (s *BinaryServer) Serve(ln net.Listener) error {
 }
 
 func (s *BinaryServer) handle(conn net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+		}
+	}()
 	defer conn.Close()
 
 	authenticated := s.authMode == AuthNone
@@ -126,13 +133,19 @@ func (s *BinaryServer) handle(conn net.Conn) {
 		}
 
 		if needsAuth && !authenticated {
-			if writeErr(conn) != nil {
-				return
+			if op == OpSet || op == OpSync {
+				if _, err := io.ReadFull(conn, hdr[:5]); err != nil {
+					return
+				}
+				valLen := binary.LittleEndian.Uint32(hdr[:4])
+				if valLen > uint32(MaxValueSize) {
+					writeErr(conn)
+					return
+				}
+				io.CopyN(io.Discard, conn, int64(valLen))
 			}
-			if op == OpSet || op == OpDelete || op == OpSync {
-				return
-			}
-			continue
+			writeErr(conn)
+			return
 		}
 
 		switch op {
@@ -176,6 +189,13 @@ func (s *BinaryServer) handle(conn net.Conn) {
 			valLen := binary.LittleEndian.Uint32(hdr[:4])
 			compressed := hdr[4] == 1
 
+			if valLen > uint32(MaxValueSize) {
+				if writeErr(conn) != nil {
+					return
+				}
+				continue
+			}
+
 			if cap(valBuf) < int(valLen) {
 				valBuf = make([]byte, valLen)
 			}
@@ -186,6 +206,13 @@ func (s *BinaryServer) handle(conn net.Conn) {
 
 			data, err := decompress(valBuf, compressed)
 			if err != nil {
+				if writeErr(conn) != nil {
+					return
+				}
+				continue
+			}
+
+			if len(data) > MaxValueSize {
 				if writeErr(conn) != nil {
 					return
 				}
@@ -203,15 +230,14 @@ func (s *BinaryServer) handle(conn net.Conn) {
 			}
 
 		case OpDelete:
-			s.vault.storage.Delete(string(keyBuf))
-			nodes := s.vault.cluster.hash(string(keyBuf), ReplicaCount)
-			for _, node := range nodes {
-				if node != s.vault.cluster.self {
-					go s.vault.cluster.sendDelete(node, string(keyBuf))
+			if err := s.vault.cluster.delete(string(keyBuf)); err != nil {
+				if writeErr(conn) != nil {
+					return
 				}
-			}
-			if _, err := conn.Write([]byte{0x00, 0, 0, 0, 0}); err != nil {
-				return
+			} else {
+				if _, err := conn.Write([]byte{0x00, 0, 0, 0, 0}); err != nil {
+					return
+				}
 			}
 
 		case OpSync:
@@ -220,6 +246,13 @@ func (s *BinaryServer) handle(conn net.Conn) {
 			}
 			valLen := binary.LittleEndian.Uint32(hdr[:4])
 			compressed := hdr[4] == 1
+
+			if valLen > uint32(MaxValueSize) {
+				if writeErr(conn) != nil {
+					return
+				}
+				continue
+			}
 
 			if cap(valBuf) < int(valLen) {
 				valBuf = make([]byte, valLen)
@@ -231,6 +264,13 @@ func (s *BinaryServer) handle(conn net.Conn) {
 
 			data, err := decompress(valBuf, compressed)
 			if err != nil {
+				if writeErr(conn) != nil {
+					return
+				}
+				continue
+			}
+
+			if len(data) > MaxValueSize {
 				if writeErr(conn) != nil {
 					return
 				}
@@ -343,11 +383,33 @@ func (c *BinaryClient) getPool(addr string) *connPool {
 	return actual.(*connPool)
 }
 
-func (c *BinaryClient) Sync(addr, key string, data []byte) error {
+func (c *BinaryClient) Sync(addr, key, authKey string, data []byte) error {
 	pool := c.getPool(addr)
 	conn, err := pool.Get()
 	if err != nil {
 		return err
+	}
+
+	if authKey != "" {
+		authReq := make([]byte, 3+len(authKey))
+		authReq[0] = OpAuth
+		binary.LittleEndian.PutUint16(authReq[1:3], uint16(len(authKey)))
+		copy(authReq[3:], authKey)
+
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write(authReq); err != nil {
+			conn.Close()
+			return err
+		}
+		authResp := make([]byte, 5)
+		if _, err := io.ReadFull(conn, authResp); err != nil {
+			conn.Close()
+			return err
+		}
+		if authResp[0] != 0x00 {
+			conn.Close()
+			return fmt.Errorf("auth failed")
+		}
 	}
 
 	compressed := compress(data)
@@ -366,6 +428,7 @@ func (c *BinaryClient) Sync(addr, key string, data []byte) error {
 	}
 	copy(req[3+len(key)+5:], compressed)
 
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write(req); err != nil {
 		conn.Close()
 		return err
@@ -376,9 +439,9 @@ func (c *BinaryClient) Sync(addr, key string, data []byte) error {
 		conn.Close()
 		return err
 	}
+	conn.SetDeadline(time.Time{})
 
 	pool.Put(conn)
-
 	if resp[0] != 0x00 {
 		return fmt.Errorf("sync failed")
 	}
@@ -397,6 +460,7 @@ func (c *BinaryClient) Get(addr, key string) ([]byte, error) {
 	binary.LittleEndian.PutUint16(req[1:3], uint16(len(key)))
 	copy(req[3:], key)
 
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write(req); err != nil {
 		conn.Close()
 		return nil, err
@@ -409,6 +473,7 @@ func (c *BinaryClient) Get(addr, key string) ([]byte, error) {
 	}
 
 	if resp[0] != 0x00 {
+		conn.SetDeadline(time.Time{})
 		pool.Put(conn)
 		return nil, fmt.Errorf("not found")
 	}
@@ -419,16 +484,39 @@ func (c *BinaryClient) Get(addr, key string) ([]byte, error) {
 		conn.Close()
 		return nil, err
 	}
+	conn.SetDeadline(time.Time{})
 
 	pool.Put(conn)
 	return data, nil
 }
 
-func (c *BinaryClient) Delete(addr, key string) error {
+func (c *BinaryClient) Delete(addr, key, authKey string) error {
 	pool := c.getPool(addr)
 	conn, err := pool.Get()
 	if err != nil {
 		return err
+	}
+
+	if authKey != "" {
+		authReq := make([]byte, 3+len(authKey))
+		authReq[0] = OpAuth
+		binary.LittleEndian.PutUint16(authReq[1:3], uint16(len(authKey)))
+		copy(authReq[3:], authKey)
+
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write(authReq); err != nil {
+			conn.Close()
+			return err
+		}
+		authResp := make([]byte, 5)
+		if _, err := io.ReadFull(conn, authResp); err != nil {
+			conn.Close()
+			return err
+		}
+		if authResp[0] != 0x00 {
+			conn.Close()
+			return fmt.Errorf("auth failed")
+		}
 	}
 
 	req := make([]byte, 3+len(key))
@@ -436,6 +524,7 @@ func (c *BinaryClient) Delete(addr, key string) error {
 	binary.LittleEndian.PutUint16(req[1:3], uint16(len(key)))
 	copy(req[3:], key)
 
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write(req); err != nil {
 		conn.Close()
 		return err
@@ -446,6 +535,7 @@ func (c *BinaryClient) Delete(addr, key string) error {
 		conn.Close()
 		return err
 	}
+	conn.SetDeadline(time.Time{})
 
 	pool.Put(conn)
 	return nil

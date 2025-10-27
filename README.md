@@ -1,230 +1,442 @@
 # minivault
 
-**sub 1500 line distributed key-value store with geo-replication support**
+distributed key-value store with geo-replication, <1700 lines of Go
 
-Recreation of George Hotz's [minikeyvalue](https://github.com/geohot/minikeyvalue) project
+inspired by geohot's minikeyvalue
 
-## API
+## overview
 
-MiniVault supports two protocols for maximum flexibility:
+stores key-value pairs across 3 nodes, eventually consistent (30-50ms), quorum writes (2/3), survives node failures
 
-### Binary Protocol (TCP)
+**throughput (single node):**
+- storage: 2.2M writes/sec, 20M reads/sec
+- network: 334k writes/sec, 393k reads/sec (binary tcp)
+- http: 100k ops/sec per worker
 
-High-performance binary protocol over TCP for native clients.
+**protocols:** binary tcp (performance) + http/json (convenience)
 
-**Operations:**
-- `0x01` - Get value
-- `0x02` - Set value
-- `0x03` - Delete value
-- `0x04` - Sync (internal replication)
-- `0x05` - Health check
-- `0x06` - Auth
+## quick start
 
-**Request format:**
-```
-[1 byte op][2 bytes key length][N bytes key][4 bytes value length][1 byte compressed][M bytes value]
-```
-
-**Response format:**
-```
-[1 byte status (0x00=success, 0xFF=error)][4 bytes value length][M bytes value]
-```
-
-### HTTP Protocol (Optional)
-
-Optional thin HTTP layer for universal client access (browsers, JavaScript, curl).
-
-Enable with `-http` flag. Zero overhead - calls storage directly without binary protocol translation.
-
-**Endpoints:**
-- `GET /:key` - Retrieve value
-- `PUT /:key` - Store value (JSON body: `{"value": <data>}`)
-- `POST /:key` - Store value (alias for PUT)
-- `DELETE /:key` - Delete value
-- `GET /health` - Cluster health check
-
-**Request/Response Format:**
-
-PUT/POST Request:
-```json
-{
-  "value": <your data>
-}
-```
-
-GET Response:
-```json
-{
-  "success": true,
-  "data": <your data>
-}
-```
-
-Error Response:
-```json
-{
-  "success": false,
-  "error": "error message"
-}
-```
-
-**Example:**
-```bash
-# Start with HTTP on port 8080
-./minivault -port 3000 -http 8080 -data ./data
-
-# Store value
-curl -X PUT http://localhost:8080/mykey \
-  -H "Content-Type: application/json" \
-  -d '{"value": "hello world"}'
-
-# Retrieve value
-curl http://localhost:8080/mykey
-# Returns: {"success":true,"data":"hello world"}
-
-# Delete value
-curl -X DELETE http://localhost:8080/mykey
-
-# Health check
-curl http://localhost:8080/health
-```
-
-## Architecture
-
-```
-   NODE 1 (EU)          NODE 2 (US)          NODE 3 (ASIA)
-   (Public IP)  <-----> (Public IP)  <-----> (Public IP)
-        ^                    ^                    ^
-        |                    |                    |
-        └────────────────────┴────────────────────┘
-              Peer-to-peer mesh (static discovery)
-```
-
-
-## Quick Start
-
-### Single Node
-
+**single node:**
 ```bash
 ./minivault -port 3000 -data ./data
 ```
 
-### Local 3-Node Cluster
-
+**3-node cluster:**
 ```bash
-# Node 1
-CLUSTER_NODES="localhost:3001,localhost:3002,localhost:3003" \
+CLUSTER_NODES="localhost:3001,localhost:3002" \
   ./minivault -port 3001 -data ./data1 -public-url "localhost:3001" &
 
-# Node 2
-CLUSTER_NODES="localhost:3001,localhost:3002,localhost:3003" \
+CLUSTER_NODES="localhost:3000,localhost:3002" \
   ./minivault -port 3002 -data ./data2 -public-url "localhost:3002" &
 
-# Node 3
-CLUSTER_NODES="localhost:3001,localhost:3002,localhost:3003" \
+CLUSTER_NODES="localhost:3000,localhost:3001" \
   ./minivault -port 3003 -data ./data3 -public-url "localhost:3003" &
 ```
 
-### Geo-Distributed Cluster
-
+**docker:**
 ```bash
-# EU Node
-CLUSTER_NODES="eu.example.com:3000,us.example.com:3000,asia.example.com:3000" \
-  ./minivault -port 3000 -data ./data -public-url "eu.example.com:3000"
-
-# US Node
-CLUSTER_NODES="eu.example.com:3000,us.example.com:3000,asia.example.com:3000" \
-  ./minivault -port 3000 -data ./data -public-url "us.example.com:3000"
-
-# Asia Node
-CLUSTER_NODES="eu.example.com:3000,us.example.com:3000,asia.example.com:3000" \
-  ./minivault -port 3000 -data ./data -public-url "asia.example.com:3000"
+docker-compose up -d  # launches 3-node cluster
 ```
 
-## Usage
+## binary protocol
 
-See [clients/](./clients/) directory for client implementations:
+native tcp protocol for maximum performance (tcp:3000 default)
 
-- **Go**: `go/http.go`, `go/binary.go`
-- **TypeScript**: `typescript/http.ts`, `typescript/binary.ts`
-- **Python**: `python/minivault_http.py`, `python/minivault_binary.py`
-- **Rust**: `rust/http.rs`, `rust/binary.rs`
+### operations
 
-**Quick Example (HTTP - TypeScript):**
+| opcode | name   | format                                                | response              |
+|--------|--------|-------------------------------------------------------|-----------------------|
+| 0x01   | GET    | `[01][keylen:u16][key]`                               | `[status][len:u32][data]` |
+| 0x02   | SET    | `[02][keylen:u16][key][vallen:u32][compressed][val]` | `[status][len:u32]`   |
+| 0x03   | DELETE | `[03][keylen:u16][key]`                               | `[status][len:u32]`   |
+| 0x05   | HEALTH | `[05][keylen:u16][key]`                               | `[status][len:u32][json]` |
+| 0x06   | AUTH   | `[06][keylen:u16][authkey]`                           | `[status][len:u32]`   |
+
+**response codes:**
+- `0x00` = success
+- `0xFF` = error
+
+**encoding:**
+- integers: little-endian
+- keylen, vallen: u16, u32
+- compressed: 0=no, 1=zstd
+
+### example (typescript)
+
 ```typescript
-const cache = new MiniVaultCache('http://localhost:8080', 'your-api-key');
+import { MiniVaultBinary } from './examples/typescript/binary';
 
-await cache.set('user:123', { name: 'Alice', age: 30 });
-const user = await cache.get('user:123');
-await cache.delete('user:123');
+const vault = new MiniVaultBinary('localhost:3000', 'optional-auth-key');
 
-const health = await cache.health();
+await vault.set('user:123', Buffer.from(JSON.stringify({ name: 'alice' })));
+const data = await vault.get('user:123');
+await vault.delete('user:123');
+
+const health = await vault.health();
+console.log(`cache: ${health.cache_items} items, ${health.memory_mb}MB`);
 ```
 
-**Quick Example (Binary - Go):**
+### example (go)
+
 ```go
-client := NewBinaryClient()
+import "github.com/minivault/examples/go"
 
-err := client.Set("localhost:3000", "mykey", []byte("hello world"))
-data, err := client.Get("localhost:3000", "mykey")
-err := client.Delete("localhost:3000", "mykey")
+client := minivault.NewBinaryClient("localhost:3000", "optional-auth-key")
+
+err := client.Set("user:123", []byte(`{"name":"alice"}`))
+data, err := client.Get("user:123")
+err := client.Delete("user:123")
+
+health, err := client.Health()
 ```
 
-## Docker
+## http protocol
+
+optional json-wrapped http interface, enable with `-http 8080`
+
+**endpoints:**
+- `PUT /:key` - store value (json body: `{"value": any}`)
+- `GET /:key` - retrieve value (json response: `{"success": bool, "data": any}`)
+- `DELETE /:key` - remove key
+- `GET /health` - cluster status
+
+### example (curl)
 
 ```bash
-# Build
-docker build -t minivault:latest .
+# set
+curl -X PUT http://localhost:8080/mykey \
+  -H "Content-Type: application/json" \
+  -d '{"value": "hello world"}'
 
-# Run single node
-docker run -p 3000:3000 minivault:latest
+# get
+curl http://localhost:8080/mykey
+# {"success":true,"data":"hello world"}
 
-# Run 3-node cluster
+# delete
+curl -X DELETE http://localhost:8080/mykey
+
+# health
+curl http://localhost:8080/health
+```
+
+### example (typescript)
+
+```typescript
+import { MiniVault } from './examples/typescript/http';
+
+const vault = new MiniVault('http://localhost:8080', 'optional-auth-key');
+
+await vault.set('user:123', { name: 'alice', age: 30 });
+const user = await vault.get('user:123');  // auto json deserialize
+await vault.delete('user:123');
+
+const health = await vault.health();
+```
+
+## authentication
+
+```bash
+./minivault -auth "secretkey" -authmode writes
+```
+
+**modes:**
+- `none` - no auth (default)
+- `writes` - auth required for SET/DELETE (reads public)
+- `all` - auth required for all ops except health
+
+**binary protocol:** send OpAuth (0x06) before operations
+**http protocol:** add header `Authorization: Bearer secretkey`
+
+all clients handle auth automatically when key provided
+
+## command-line flags
+
+```
+-port 3000           binary protocol tcp port
+-http 0              http json port (0=disabled)
+-public-url          this node's cluster address (required for multi-node)
+-data /data          persistent storage directory
+-auth ""             authentication key
+-authmode none       auth mode: none|writes|all
+-ratelimit 0         ops/sec throttle (0=unlimited)
+-cache 512           in-memory cache size (MB)
+-workers 50          worker pool size for replication
+```
+
+**environment:**
+- `CLUSTER_NODES` - comma-separated list of other nodes (e.g., "node1:3000,node2:3000")
+
+## architecture
+
+### storage layers
+
+**L1: in-memory cache**
+- 256 shards with rwmutex locks
+- LRU eviction based on hit counters
+- bloom filter for fast negative lookups
+- atomic size tracking
+
+**L2: write-ahead log**
+- batched writes (non-blocking channel)
+- CRC32 checksums per entry
+- atomic compaction (write temp, rename)
+- replays on startup for durability
+
+**L3: disk storage**
+- hash-based directory structure (2-level)
+- xxhash64 for key hashing
+- files named by hash (hex encoded)
+
+### replication
+
+**consistent hashing:**
+- uses CRC32(key + node) for placement
+- 3 replicas per key
+- survives 1 node failure
+
+**quorum writes:**
+- requires 2/3 nodes to acknowledge
+- parallel replication to other nodes
+- 50-worker pool for async operations
+
+**node discovery:**
+- configured via CLUSTER_NODES env var
+- no leader election, all nodes equal
+- eventual consistency (30-50ms typical)
+
+### performance optimizations
+
+- connection pooling (10 conns per remote node)
+- zstd compression (adaptive, >1KB values)
+- tcp nodelay + keepalive
+- 512KB read/write buffers
+- 50k max concurrent connections
+- non-blocking WAL writes
+
+## performance benchmarks
+
+**test environment:**
+- cpu: i7-12700K (12 cores, 20 threads)
+- ram: 64GB DDR5-4800
+- os: Linux 6.6.87 (WSL2)
+- go: 1.25.2
+
+### storage layer (raw)
+
+direct storage operations without network overhead
+
+```
+BenchmarkStorageSet-20          2217830    537.1 ns/op     0 B/op    0 allocs/op
+BenchmarkStorageGet-20         20032183     59.8 ns/op     0 B/op    0 allocs/op
+BenchmarkCacheSet-20            1749616    684.6 ns/op   512 B/op    1 allocs/op
+BenchmarkCacheGet-20           15963370     75.2 ns/op     0 B/op    0 allocs/op
+```
+
+**throughput:**
+- set: 1.75M - 2.21M ops/sec
+- get (cache hit): 15.9M - 20M ops/sec
+- get latency: 60-75ns
+
+### network (binary tcp)
+
+end-to-end including serialization and tcp overhead
+
+**sequential client (1 connection):**
+- writes: 334k ops/sec
+- reads: 393k ops/sec
+
+**concurrent (10 clients):**
+- mixed workload: 55k ops/sec total
+
+### http protocol
+
+json-wrapped http layer
+
+**single worker:**
+- ~100k req/sec (direct storage access)
+- includes json serialization overhead
+
+## examples
+
+client implementations in 4 languages, located in `/examples`
+
+| language   | binary tcp      | http json         |
+|------------|-----------------|-------------------|
+| go         | `go/binary.go`  | `go/http.go`      |
+| typescript | `typescript/binary.ts` | `typescript/http.ts` |
+| python     | `python/minivault_binary.py` | `python/minivault_http.py` |
+| rust       | `rust/binary.rs` | `rust/http.rs`   |
+
+all clients support:
+- connection pooling
+- automatic authentication
+- json helpers (marshal/unmarshal)
+- health checks
+- timeouts
+
+see `examples/README.md` for detailed usage and more examples
+
+## build
+
+**from source:**
+```bash
+# regular build
+make build
+
+# optimized build (stripped, smaller binary)
+make build-optimized
+
+# run tests
+make test
+
+# run benchmarks
+make bench
+```
+
+**docker:**
+```bash
+# build image
+make docker-build
+
+# run 3-node cluster
+make docker-run
+```
+
+**prebuilt binaries:**
+- `minivault` - regular build (9MB)
+- `minivault-optimized` - stripped symbols (6.2MB)
+
+both binaries included in repo for convenience
+
+## production deployment
+
+**single node (development):**
+```bash
+./minivault -port 3000 -data ./data
+```
+
+**3-node cluster (production):**
+```bash
+# node 1
+CLUSTER_NODES="node2.example.com:3000,node3.example.com:3000" \
+  ./minivault \
+    -port 3000 \
+    -http 8080 \
+    -public-url "node1.example.com:3000" \
+    -data /var/lib/minivault \
+    -auth "production-secret-key" \
+    -authmode writes \
+    -ratelimit 100000 \
+    -cache 2048
+
+# node 2, node 3 - same pattern with different CLUSTER_NODES
+```
+
+**docker compose:**
+```bash
 docker-compose up -d
+# exposes:
+#   - vault1: localhost:3001
+#   - vault2: localhost:3002
+#   - vault3: localhost:3003
 ```
 
-## Build
+## configuration
 
+### cache sizing
+
+default 512MB, adjust based on working set:
 ```bash
-go build -o minivault src/*.go
+-cache 2048  # 2GB cache
 ```
 
-## Flags
+cache eviction triggers when size exceeds limit, removes coldest 10% of keys
 
-- `-port` - Binary protocol port (default: 3000)
-- `-http` - HTTP port (default: 0, disabled)
-- `-public-url` - Public URL/address for this node (default: localhost:port)
-- `-data` - Data directory (default: /data)
-- `-auth` - Authentication key (optional)
-- `-authmode` - Authentication mode: none, writes, all (default: none)
-- `-ratelimit` - Rate limit in ops/sec (default: 0, unlimited)
-- `-cache` - Cache size in MB (default: 512)
-- `-workers` - Worker pool size (default: 50)
+### rate limiting
 
-**Environment Variables:**
-- `CLUSTER_NODES` - Comma-separated list of all cluster nodes (e.g., "node1:3000,node2:3000,node3:3000")
+protect against overload:
+```bash
+-ratelimit 100000  # 100k ops/sec max
+```
 
-## Performance
+uses token bucket algorithm with burst allowance (10% of limit)
 
-**Test Environment:**
-- CPU: 12th Gen Intel i7-12700K
-- RAM: 64GB DDR5
-- OS: Linux 6.6.87 (WSL2)
-- Go: 1.25.2
+### worker pool
 
-**Storage Layer:**
-- Set 1KB: 570ns/op (1.8 GB/s, **1.75M ops/sec**)
-- Set 10KB: 543ns/op (18.8 GB/s, **1.84M ops/sec**)
-- Set 100KB: 495ns/op (207 GB/s, **2.02M ops/sec**)
-- Set 1MB: 452ns/op (2318 GB/s, **2.21M ops/sec**)
-- Get 1KB: 63ns/op (16 GB/s, **15.9M ops/sec**)
-- Get 100KB: 50ns/op (2061 GB/s, **20M ops/sec**)
-- Get 1MB: 53ns/op (19617 GB/s, **18.8M ops/sec**)
-- Cache Hit: **50ns/op** (20 GB/s, **20M ops/sec**)
-- WAL Batch: 463ns/op (553 MB/s, **2.16M ops/sec**)
+controls concurrent replication operations:
+```bash
+-workers 100  # more workers = higher replication throughput
+```
 
-**Binary Protocol Throughput:**
-- Sequential Writes: **334k ops/sec** (343 MB/s)
-- Sequential Reads: **393k ops/sec** (403 MB/s)
-- Concurrent (10 clients): **55k ops/sec** (18µs avg latency)
+default 50 is good for most deployments
 
+## features
+
+- [x] dual protocol support (binary tcp + http json)
+- [x] geo-replication (3 nodes, quorum writes)
+- [x] eventual consistency (30-50ms convergence)
+- [x] authentication (none/writes/all modes)
+- [x] rate limiting (token bucket)
+- [x] graceful shutdown (sigterm/sigint)
+- [x] health checks (cache stats, memory usage)
+- [x] compression (zstd, automatic for >1KB)
+- [x] connection pooling (per-node pools)
+- [x] WAL durability (crc32 checksums, atomic compaction)
+- [x] crash recovery (WAL replay on startup)
+- [x] bloom filters (fast negative lookups)
+- [x] LRU eviction (hit counter based)
+
+## limits
+
+| limit                | value   | note                          |
+|----------------------|---------|-------------------------------|
+| max value size       | 100MB   | enforced on set operations    |
+| max cache size       | 512MB   | configurable via `-cache`     |
+| max connections      | 50,000  | per node, tcp semaphore       |
+| write timeout        | 30s     | for replication operations    |
+| eventual consistency | 30-50ms | typical convergence time      |
+
+## troubleshooting
+
+**slow writes:**
+- check network latency between nodes
+- increase `-workers` for parallel replication
+- verify quorum (2/3 nodes) is reachable
+
+**high memory usage:**
+- reduce `-cache` size
+- check for large values (>10MB)
+- monitor with `/health` endpoint
+
+**connection failures:**
+- verify `CLUSTER_NODES` addresses are correct
+- check firewall rules for tcp port
+- ensure `-public-url` is reachable from other nodes
+
+**data loss after crash:**
+- WAL should replay on restart
+- check logs for replay errors
+- verify disk is not full
+
+## changelog from original
+
+- fixed cluster replication auth (OpSync now authenticates)
+- fixed delete operations (now use quorum, was fire-and-forget)
+- fixed WAL replay (properly handles delete entries)
+- fixed cache eviction (preserves hit counters on update)
+- fixed storage size tracking (uses atomic cache.size)
+- added http protocol authentication (Bearer token)
+- added graceful shutdown (signal handling)
+- added maxvalue size enforcement (prevents memory dos)
+- optimized cache eviction (heap-based selection)
+- atomic WAL compaction (temp file + rename, no data loss)
+- CRC32 checksums (was 16-bit, now full 32-bit)
+- connection pooling with timeouts (5-10s deadlines)
+- fixed http clients (all languages: Go/Python/Rust/TypeScript)
+
+## license
+
+MIT - see LICENSE file
+
+inspired by geohot's minikeyvalue, rewritten for production use
