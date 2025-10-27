@@ -6,7 +6,7 @@ inspired by geohot's minikeyvalue
 
 ## overview
 
-stores key-value pairs across 3 nodes, eventually consistent (30-50ms), quorum writes (2/3), survives node failures
+stores key-value pairs across nodes, eventually consistent (30-50ms), quorum writes (2/3), survives node failures
 
 **throughput (single node):**
 - storage: 2.2M writes/sec, 20M reads/sec
@@ -41,7 +41,7 @@ docker-compose up -d  # launches 3-node cluster
 
 ## binary protocol
 
-native tcp protocol for maximum performance (tcp:3000 default)
+native tcp protocol for performance (tcp:3000 default)
 
 ### operations
 
@@ -80,8 +80,6 @@ console.log(`cache: ${health.cache_items} items, ${health.memory_mb}MB`);
 ### example (go)
 
 ```go
-import "github.com/minivault/examples/go"
-
 client := minivault.NewBinaryClient("localhost:3000", "optional-auth-key")
 
 err := client.Set("user:123", []byte(`{"name":"alice"}`))
@@ -90,6 +88,8 @@ err := client.Delete("user:123")
 
 health, err := client.Health()
 ```
+
+see [examples](examples) for binary and http clients in typescript, go, rust and python
 
 ## http protocol
 
@@ -371,22 +371,6 @@ controls concurrent replication operations:
 
 default 50 is good for most deployments
 
-## features
-
-- [x] dual protocol support (binary tcp + http json)
-- [x] geo-replication (3 nodes, quorum writes)
-- [x] eventual consistency (30-50ms convergence)
-- [x] authentication (none/writes/all modes)
-- [x] rate limiting (token bucket)
-- [x] graceful shutdown (sigterm/sigint)
-- [x] health checks (cache stats, memory usage)
-- [x] compression (zstd, automatic for >1KB)
-- [x] connection pooling (per-node pools)
-- [x] WAL durability (crc32 checksums, atomic compaction)
-- [x] crash recovery (WAL replay on startup)
-- [x] bloom filters (fast negative lookups)
-- [x] LRU eviction (hit counter based)
-
 ## limits
 
 | limit                | value   | note                          |
@@ -418,25 +402,8 @@ default 50 is good for most deployments
 - WAL should replay on restart
 - check logs for replay errors
 - verify disk is not full
-
-## changelog from original
-
-- fixed cluster replication auth (OpSync now authenticates)
-- fixed delete operations (now use quorum, was fire-and-forget)
-- fixed WAL replay (properly handles delete entries)
-- fixed cache eviction (preserves hit counters on update)
-- fixed storage size tracking (uses atomic cache.size)
-- added http protocol authentication (Bearer token)
-- added graceful shutdown (signal handling)
-- added maxvalue size enforcement (prevents memory dos)
-- optimized cache eviction (heap-based selection)
-- atomic WAL compaction (temp file + rename, no data loss)
-- CRC32 checksums (was 16-bit, now full 32-bit)
-- connection pooling with timeouts (5-10s deadlines)
-- fixed http clients (all languages: Go/Python/Rust/TypeScript)
-
 ## license
 
 MIT - see LICENSE file
 
-inspired by geohot's minikeyvalue, rewritten for production use
+inspired by geohot's minikeyvalue, rewritten for actual production use
